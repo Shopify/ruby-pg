@@ -147,9 +147,7 @@ pgresult_clear( void *_this )
 	t_pg_result *this = (t_pg_result *)_this;
 	if( this->pgresult && !this->autoclear ){
 		PQclear(this->pgresult);
-#ifdef HAVE_RB_GC_ADJUST_MEMORY_USAGE
 		rb_gc_adjust_memory_usage(-this->result_size);
-#endif
 	}
 	this->result_size = 0;
 	this->nfields = -1;
@@ -180,7 +178,7 @@ static const rb_data_type_t pgresult_type = {
 		pgresult_gc_mark,
 		pgresult_gc_free,
 		pgresult_memsize,
-		pg_compact_callback(pgresult_gc_compact),
+		pgresult_gc_compact,
 	},
 	0, 0,
 	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
@@ -253,9 +251,7 @@ pg_new_result(PGresult *result, VALUE rb_pgconn)
 	 */
 	this->result_size = pgresult_approx_size(result);
 
-#ifdef HAVE_RB_GC_ADJUST_MEMORY_USAGE
 	rb_gc_adjust_memory_usage(this->result_size);
-#endif
 
 	return self;
 }
@@ -323,6 +319,9 @@ pg_result_check( VALUE self )
 		case PGRES_COMMAND_OK:
 #ifdef HAVE_PQENTERPIPELINEMODE
 		case PGRES_PIPELINE_SYNC:
+#endif
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+		case PGRES_TUPLES_CHUNK:
 #endif
 			return self;
 		case PGRES_BAD_RESPONSE:
@@ -549,6 +548,7 @@ static void pgresult_init_fnames(VALUE self)
  * * +PGRES_FATAL_ERROR+
  * * +PGRES_COPY_BOTH+
  * * +PGRES_SINGLE_TUPLE+
+ * * +PGRES_TUPLES_CHUNK+
  * * +PGRES_PIPELINE_SYNC+
  * * +PGRES_PIPELINE_ABORTED+
  *
@@ -613,14 +613,12 @@ pgresult_error_message(VALUE self)
 	return ret;
 }
 
-#ifdef HAVE_PQRESULTVERBOSEERRORMESSAGE
 /*
  * call-seq:
  *    res.verbose_error_message( verbosity, show_context ) -> String
  *
  * Returns a reformatted version of the error message associated with a PGresult object.
  *
- * Available since PostgreSQL-9.6
  */
 static VALUE
 pgresult_verbose_error_message(VALUE self, VALUE verbosity, VALUE show_context)
@@ -639,7 +637,6 @@ pgresult_verbose_error_message(VALUE self, VALUE verbosity, VALUE show_context)
 
 	return ret;
 }
-#endif
 
 /*
  * call-seq:
@@ -664,7 +661,7 @@ pgresult_verbose_error_message(VALUE self, VALUE verbosity, VALUE show_context)
  * An example:
  *
  *   begin
- *       conn.exec( "SELECT * FROM nonexistant_table" )
+ *       conn.exec( "SELECT * FROM nonexistent_table" )
  *   rescue PG::Error => err
  *       p [
  *           err.result.error_field( PG::Result::PG_DIAG_SEVERITY ),
@@ -684,7 +681,7 @@ pgresult_verbose_error_message(VALUE self, VALUE verbosity, VALUE show_context)
  *
  * Outputs:
  *
- *   ["ERROR", "42P01", "relation \"nonexistant_table\" does not exist", nil, nil,
+ *   ["ERROR", "42P01", "relation \"nonexistent_table\" does not exist", nil, nil,
  *    "15", nil, nil, nil, "path/to/parse_relation.c", "857", "parserOpenTable"]
  */
 static VALUE
@@ -1528,6 +1525,9 @@ pgresult_stream_any(VALUE self, int (*yielder)(VALUE, int, int, void*), void* da
 					return self;
 				rb_raise( rb_eInvalidResultStatus, "PG::Result is not in single row mode");
 			case PGRES_SINGLE_TUPLE:
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+			case PGRES_TUPLES_CHUNK:
+#endif
 				break;
 			default:
 				pg_result_check( self );
@@ -1572,7 +1572,7 @@ pgresult_stream_any(VALUE self, int (*yielder)(VALUE, int, int, void*), void* da
  * wrapping each row into a dedicated result object, it delivers data in nearly
  * the same speed as with ordinary results.
  *
- * The base result must be in status PGRES_SINGLE_TUPLE.
+ * The base result must be in status PGRES_SINGLE_TUPLE or PGRES_TUPLES_CHUNK.
  * It iterates over all tuples until the status changes to PGRES_TUPLES_OK.
  * A PG::Error is raised for any errors from the server.
  *
@@ -1707,10 +1707,8 @@ init_pg_result(void)
 	rb_define_singleton_method(rb_cPGresult, "res_status", pgresult_s_res_status, 1);
 	rb_define_method(rb_cPGresult, "error_message", pgresult_error_message, 0);
 	rb_define_alias( rb_cPGresult, "result_error_message", "error_message");
-#ifdef HAVE_PQRESULTVERBOSEERRORMESSAGE
 	rb_define_method(rb_cPGresult, "verbose_error_message", pgresult_verbose_error_message, 2);
 	rb_define_alias( rb_cPGresult, "result_verbose_error_message", "verbose_error_message");
-#endif
 	rb_define_method(rb_cPGresult, "error_field", pgresult_error_field, 1);
 	rb_define_alias( rb_cPGresult, "result_error_field", "error_field" );
 	rb_define_method(rb_cPGresult, "clear", pg_result_clear, 0);

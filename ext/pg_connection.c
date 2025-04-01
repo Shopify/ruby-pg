@@ -30,10 +30,7 @@ static VALUE pgconn_async_flush(VALUE self);
 /*
  * Convenience function to raise connection errors
  */
-#ifdef __GNUC__
-__attribute__((format(printf, 3, 4)))
-#endif
-static void
+void
 pg_raise_conn_error( VALUE klass, VALUE self, const char *format, ...)
 {
 	VALUE msg, error;
@@ -96,6 +93,20 @@ pg_get_pgconn( VALUE self )
 }
 
 
+void
+pg_unwrap_socket_io( VALUE self, VALUE *p_socket_io, int ruby_sd )
+{
+	if ( RTEST(*p_socket_io) ) {
+#if defined(_WIN32)
+		if( rb_w32_unwrap_io_handle(ruby_sd) )
+			pg_raise_conn_error( rb_eConnectionBad, self, "Could not unwrap win32 socket handle");
+#endif
+		rb_funcall( *p_socket_io, rb_intern("close"), 0 );
+	}
+
+	RB_OBJ_WRITE(self, p_socket_io, Qnil);
+}
+
 
 /*
  * Close the associated socket IO object if there is one.
@@ -104,17 +115,7 @@ static void
 pgconn_close_socket_io( VALUE self )
 {
 	t_pg_connection *this = pg_get_connection( self );
-	VALUE socket_io = this->socket_io;
-
-	if ( RTEST(socket_io) ) {
-#if defined(_WIN32)
-		if( rb_w32_unwrap_io_handle(this->ruby_sd) )
-			pg_raise_conn_error( rb_eConnectionBad, self, "Could not unwrap win32 socket handle");
-#endif
-		rb_funcall( socket_io, rb_intern("close"), 0 );
-	}
-
-	RB_OBJ_WRITE(self, &this->socket_io, Qnil);
+	pg_unwrap_socket_io( self, &this->socket_io, this->ruby_sd);
 }
 
 
@@ -230,7 +231,7 @@ static const rb_data_type_t pg_connection_type = {
 		pgconn_gc_mark,
 		pgconn_gc_free,
 		pgconn_memsize,
-		pg_compact_callback(pgconn_gc_compact),
+		pgconn_gc_compact,
 	},
 	0,
 	0,
@@ -264,6 +265,7 @@ pgconn_s_allocate( VALUE klass )
 	RB_OBJ_WRITE(self, &this->decoder_for_get_copy_data, Qnil);
 	RB_OBJ_WRITE(self, &this->trace_stream, Qnil);
 	rb_ivar_set(self, rb_intern("@calls_to_put_copy_data"), INT2FIX(0));
+	rb_ivar_set(self, rb_intern("@iopts_for_reset"), Qnil);
 
 	return self;
 }
@@ -418,7 +420,6 @@ pgconn_s_conninfo_parse(VALUE self, VALUE conninfo)
 }
 
 
-#ifdef HAVE_PQENCRYPTPASSWORDCONN
 static VALUE
 pgconn_sync_encrypt_password(int argc, VALUE *argv, VALUE self)
 {
@@ -442,7 +443,6 @@ pgconn_sync_encrypt_password(int argc, VALUE *argv, VALUE self)
 
 	return rval;
 }
-#endif
 
 
 /*
@@ -515,9 +515,9 @@ static VALUE
 pgconn_connect_poll(VALUE self)
 {
 	PostgresPollingStatusType status;
-	status = gvl_PQconnectPoll(pg_get_pgconn(self));
 
 	pgconn_close_socket_io(self);
+	status = gvl_PQconnectPoll(pg_get_pgconn(self));
 
 	return INT2FIX((int)status);
 }
@@ -608,16 +608,16 @@ pgconn_reset_start(VALUE self)
  *    conn.reset_poll -> Integer
  *
  * Checks the status of a connection reset operation.
- * See #connect_start and #connect_poll for
+ * See Connection.connect_start and #connect_poll for
  * usage information and return values.
  */
 static VALUE
 pgconn_reset_poll(VALUE self)
 {
 	PostgresPollingStatusType status;
-	status = gvl_PQresetPoll(pg_get_pgconn(self));
 
 	pgconn_close_socket_io(self);
+	status = gvl_PQresetPoll(pg_get_pgconn(self));
 
 	return INT2FIX((int)status);
 }
@@ -759,7 +759,6 @@ pgconn_options(VALUE self)
  *
  * Returns the connection options used by a live connection.
  *
- * Available since PostgreSQL-9.3
  */
 static VALUE
 pgconn_conninfo( VALUE self )
@@ -846,31 +845,52 @@ pgconn_parameter_status(VALUE self, VALUE param_name)
  * call-seq:
  *   conn.protocol_version -> Integer
  *
- * The 3.0 protocol will normally be used when communicating with PostgreSQL 7.4
- * or later servers; pre-7.4 servers support only protocol 2.0. (Protocol 1.0 is
- * obsolete and not supported by libpq.)
+ * Interrogates the frontend/backend protocol being used.
+ *
+ * Applications might wish to use this function to determine whether certain features are supported.
+ * Currently, the only value is 3 (3.0 protocol).
+ * The protocol version will not change after connection startup is complete, but it could theoretically change during a connection reset.
+ * The 3.0 protocol is supported by PostgreSQL server versions 7.4 and above.
+ *
+ * PG::ConnectionBad is raised if the connection is bad.
  */
 static VALUE
 pgconn_protocol_version(VALUE self)
 {
-	return INT2NUM(PQprotocolVersion(pg_get_pgconn(self)));
+	int protocol_version = PQprotocolVersion(pg_get_pgconn(self));
+	if (protocol_version == 0) {
+		pg_raise_conn_error( rb_eConnectionBad, self, "PQprotocolVersion() can't get protocol version");
+	}
+	return INT2NUM(protocol_version);
 }
 
 /*
  * call-seq:
  *   conn.server_version -> Integer
  *
- * The number is formed by converting the major, minor, and revision
- * numbers into two-decimal-digit numbers and appending them together.
- * For example, version 7.4.2 will be returned as 70402, and version
- * 8.1 will be returned as 80100 (leading zeroes are not shown). Zero
- * is returned if the connection is bad.
+ * Returns an integer representing the server version.
+ *
+ * Applications might use this function to determine the version of the database server they are connected to.
+ * The result is formed by multiplying the server's major version number by 10000 and adding the minor version number.
+ * For example, version 10.1 will be returned as 100001, and version 11.0 will be returned as 110000.
+ *
+ * PG::ConnectionBad is raised if the connection is bad.
+ *
+ * Prior to major version 10, PostgreSQL used three-part version numbers in which the first two parts together represented the major version.
+ * For those versions, PQserverVersion uses two digits for each part; for example version 9.1.5 will be returned as 90105, and version 9.2.0 will be returned as 90200.
+ *
+ * Therefore, for purposes of determining feature compatibility, applications should divide the result of PQserverVersion by 100 not 10000 to determine a logical major version number.
+ * In all release series, only the last two digits differ between minor releases (bug-fix releases).
  *
  */
 static VALUE
 pgconn_server_version(VALUE self)
 {
-	return INT2NUM(PQserverVersion(pg_get_pgconn(self)));
+	int server_version = PQserverVersion(pg_get_pgconn(self));
+	if (server_version == 0) {
+		pg_raise_conn_error( rb_eConnectionBad, self, "PQserverVersion() can't get server version");
+	}
+	return INT2NUM(server_version);
 }
 
 /*
@@ -919,13 +939,42 @@ pgconn_socket(VALUE self)
 	return INT2NUM(sd);
 }
 
+
+VALUE
+pg_wrap_socket_io(int sd, VALUE self, VALUE *p_socket_io, int *p_ruby_sd)
+{
+	int ruby_sd;
+	VALUE cSocket;
+	VALUE socket_io = *p_socket_io;
+
+	#ifdef _WIN32
+		ruby_sd = rb_w32_wrap_io_handle((HANDLE)(intptr_t)sd, O_RDWR|O_BINARY|O_NOINHERIT);
+		if( ruby_sd == -1 )
+			pg_raise_conn_error( rb_eConnectionBad, self, "Could not wrap win32 socket handle");
+
+		*p_ruby_sd = ruby_sd;
+	#else
+		*p_ruby_sd = ruby_sd = sd;
+	#endif
+
+	cSocket = rb_const_get(rb_cObject, rb_intern("BasicSocket"));
+	socket_io = rb_funcall( cSocket, rb_intern("for_fd"), 1, INT2NUM(ruby_sd));
+
+	/* Disable autoclose feature */
+	rb_funcall( socket_io, s_id_autoclose_set, 1, Qfalse );
+
+	RB_OBJ_WRITE(self, p_socket_io, socket_io);
+
+	return socket_io;
+}
+
 /*
  * call-seq:
  *    conn.socket_io() -> IO
  *
  * Fetch an IO object created from the Connection's underlying socket.
  * This object can be used per <tt>socket_io.wait_readable</tt>, <tt>socket_io.wait_writable</tt> or for <tt>IO.select</tt> to wait for events while running asynchronous API calls.
- * <tt>IO#wait_*able</tt> is is <tt>Fiber.scheduler</tt> compatible in contrast to <tt>IO.select</tt>.
+ * <tt>IO#wait_*able</tt> is <tt>Fiber.scheduler</tt> compatible in contrast to <tt>IO.select</tt>.
  *
  * The IO object can change while the connection is established, but is memorized afterwards.
  * So be sure not to cache the IO object, but repeat calling <tt>conn.socket_io</tt> instead.
@@ -936,37 +985,17 @@ pgconn_socket(VALUE self)
 static VALUE
 pgconn_socket_io(VALUE self)
 {
-	int sd;
-	int ruby_sd;
 	t_pg_connection *this = pg_get_connection_safe( self );
-	VALUE cSocket;
-	VALUE socket_io = this->socket_io;
 
-	if ( !RTEST(socket_io) ) {
+	if ( !RTEST(this->socket_io) ) {
+		int sd;
 		if( (sd = PQsocket(this->pgconn)) < 0){
 			pg_raise_conn_error( rb_eConnectionBad, self, "PQsocket() can't get socket descriptor");
 		}
-
-		#ifdef _WIN32
-			ruby_sd = rb_w32_wrap_io_handle((HANDLE)(intptr_t)sd, O_RDWR|O_BINARY|O_NOINHERIT);
-			if( ruby_sd == -1 )
-				pg_raise_conn_error( rb_eConnectionBad, self, "Could not wrap win32 socket handle");
-
-			this->ruby_sd = ruby_sd;
-		#else
-			ruby_sd = sd;
-		#endif
-
-		cSocket = rb_const_get(rb_cObject, rb_intern("BasicSocket"));
-		socket_io = rb_funcall( cSocket, rb_intern("for_fd"), 1, INT2NUM(ruby_sd));
-
-		/* Disable autoclose feature */
-		rb_funcall( socket_io, s_id_autoclose_set, 1, Qfalse );
-
-		RB_OBJ_WRITE(self, &this->socket_io, socket_io);
+		return pg_wrap_socket_io( sd, self, &this->socket_io, &this->ruby_sd);
 	}
 
-	return socket_io;
+	return this->socket_io;
 }
 
 /*
@@ -983,6 +1012,7 @@ pgconn_backend_pid(VALUE self)
 	return INT2NUM(PQbackendPID(pg_get_pgconn(self)));
 }
 
+#ifndef HAVE_PQSETCHUNKEDROWSMODE
 typedef struct
 {
 	struct sockaddr_storage addr;
@@ -1027,6 +1057,7 @@ pgconn_backend_key(VALUE self)
 
 	return INT2NUM(be_key);
 }
+#endif
 
 /*
  * call-seq:
@@ -1299,7 +1330,7 @@ alloc_query_params(struct query_params_data *paramsData)
 				paramsData->lengths[i] = 0;
 			} else {
 				t_pg_coder_enc_func enc_func = pg_coder_enc_func( conv );
-				VALUE intermediate;
+				VALUE intermediate = Qnil;
 
 				/* 1st pass for retiving the required memory space */
 				int len = enc_func(conv, param_value, NULL, &intermediate, paramsData->enc_idx);
@@ -1339,8 +1370,6 @@ alloc_query_params(struct query_params_data *paramsData)
 						required_pool_size += len;
 					}
 				}
-
-				RB_GC_GUARD(intermediate);
 			}
 		}
 	}
@@ -1515,6 +1544,19 @@ pgconn_sync_exec_prepared(int argc, VALUE *argv, VALUE self)
 	return rb_pgresult;
 }
 
+static VALUE
+pgconn_sync_describe_close_prepared_portal(VALUE self, VALUE name, PGresult *(*func)(PGconn *, const char *))
+{
+	PGresult *result;
+	VALUE rb_pgresult;
+	t_pg_connection *this = pg_get_connection_safe( self );
+	const char *stmt = NIL_P(name) ? NULL : pg_cstr_enc(name, this->enc_idx);
+	result = func(this->pgconn, stmt);
+	rb_pgresult = pg_new_result(result, self);
+	pg_result_check(rb_pgresult);
+	return rb_pgresult;
+}
+
 /*
  * call-seq:
  *    conn.sync_describe_prepared( statement_name ) -> PG::Result
@@ -1526,20 +1568,7 @@ pgconn_sync_exec_prepared(int argc, VALUE *argv, VALUE self)
 static VALUE
 pgconn_sync_describe_prepared(VALUE self, VALUE stmt_name)
 {
-	PGresult *result;
-	VALUE rb_pgresult;
-	t_pg_connection *this = pg_get_connection_safe( self );
-	const char *stmt;
-	if(NIL_P(stmt_name)) {
-		stmt = NULL;
-	}
-	else {
-		stmt = pg_cstr_enc(stmt_name, this->enc_idx);
-	}
-	result = gvl_PQdescribePrepared(this->pgconn, stmt);
-	rb_pgresult = pg_new_result(result, self);
-	pg_result_check(rb_pgresult);
-	return rb_pgresult;
+	return pgconn_sync_describe_close_prepared_portal(self, stmt_name, gvl_PQdescribePrepared);
 }
 
 
@@ -1554,22 +1583,43 @@ pgconn_sync_describe_prepared(VALUE self, VALUE stmt_name)
 static VALUE
 pgconn_sync_describe_portal(VALUE self, VALUE stmt_name)
 {
-	PGresult *result;
-	VALUE rb_pgresult;
-	t_pg_connection *this = pg_get_connection_safe( self );
-	const char *stmt;
-	if(NIL_P(stmt_name)) {
-		stmt = NULL;
-	}
-	else {
-		stmt = pg_cstr_enc(stmt_name, this->enc_idx);
-	}
-	result = gvl_PQdescribePortal(this->pgconn, stmt);
-	rb_pgresult = pg_new_result(result, self);
-	pg_result_check(rb_pgresult);
-	return rb_pgresult;
+	return pgconn_sync_describe_close_prepared_portal(self, stmt_name, gvl_PQdescribePortal);
 }
 
+
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+/*
+ * call-seq:
+ *    conn.sync_close_prepared( stmt_name ) -> PG::Result
+ *
+ * This function has the same behavior as #async_close_prepared, but is implemented using the synchronous command processing API of libpq.
+ * See #async_exec for the differences between the two API variants.
+ * It's not recommended to use explicit sync or async variants but #close_prepared instead, unless you have a good reason to do so.
+ *
+ * Available since PostgreSQL-17.
+ */
+static VALUE
+pgconn_sync_close_prepared(VALUE self, VALUE stmt_name)
+{
+	return pgconn_sync_describe_close_prepared_portal(self, stmt_name, gvl_PQclosePrepared);
+}
+
+/*
+ * call-seq:
+ *    conn.sync_close_portal( portal_name ) -> PG::Result
+ *
+ * This function has the same behavior as #async_close_portal, but is implemented using the synchronous command processing API of libpq.
+ * See #async_exec for the differences between the two API variants.
+ * It's not recommended to use explicit sync or async variants but #close_portal instead, unless you have a good reason to do so.
+ *
+ * Available since PostgreSQL-17.
+ */
+static VALUE
+pgconn_sync_close_portal(VALUE self, VALUE stmt_name)
+{
+	return pgconn_sync_describe_close_prepared_portal(self, stmt_name, gvl_PQclosePortal);
+}
+#endif
 
 /*
  * call-seq:
@@ -1587,6 +1637,7 @@ pgconn_sync_describe_portal(VALUE self, VALUE stmt_name)
  * * +PGRES_FATAL_ERROR+
  * * +PGRES_COPY_BOTH+
  * * +PGRES_SINGLE_TUPLE+
+ * * +PGRES_TUPLES_CHUNK+
  * * +PGRES_PIPELINE_SYNC+
  * * +PGRES_PIPELINE_ABORTED+
  */
@@ -1811,14 +1862,11 @@ pgconn_escape_identifier(VALUE self, VALUE string)
  * (column names, types, etc) that an ordinary Result object for the query
  * would have.
  *
- * *Caution:* While processing a query, the server may return some rows and
- * then encounter an error, causing the query to be aborted. Ordinarily, pg
- * discards any such rows and reports only the error. But in single-row mode,
- * those rows will have already been returned to the application. Hence, the
- * application will see some Result objects followed by an Error raised in get_result.
- * For proper transactional behavior, the application must be designed to discard
- * or undo whatever has been done with the previously-processed rows, if the query
- * ultimately fails.
+ * *Caution:* While processing a query, the server may return some rows and then encounter an error, causing the query to be aborted.
+ * Ordinarily, pg discards any such rows and reports only the error.
+ * But in single-row or chunked mode, some rows may have already been returned to the application.
+ * Hence, the application will see some PGRES_SINGLE_TUPLE or PGRES_TUPLES_CHUNK PG::Result objects followed by a PG::Error raised in get_result.
+ * For proper transactional behavior, the application must be designed to discard or undo whatever has been done with the previously-processed rows, if the query ultimately fails.
  *
  * Example:
  *   conn.send_query( "your SQL command" )
@@ -1838,10 +1886,49 @@ pgconn_set_single_row_mode(VALUE self)
 
 	rb_check_frozen(self);
 	if( PQsetSingleRowMode(conn) == 0 )
-		pg_raise_conn_error( rb_ePGerror, self, "%s", PQerrorMessage(conn));
+		pg_raise_conn_error( rb_ePGerror, self, "PQsetSingleRowMode %s", PQerrorMessage(conn));
 
 	return self;
 }
+
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+/*
+ * call-seq:
+ *    conn.set_chunked_rows_mode -> self
+ *
+ * Select chunked mode for the currently-executing query.
+ *
+ * This function is similar to set_single_row_mode, except that it specifies retrieval of up to +chunk_size+ rows per PGresult, not necessarily just one row.
+ * This function can only be called immediately after send_query or one of its sibling functions, before any other operation on the connection such as consume_input or get_result.
+ * If called at the correct time, the function activates chunked mode for the current query.
+ * Otherwise the mode stays unchanged and the function raises an error.
+ * In any case, the mode reverts to normal after completion of the current query.
+ *
+ * Example:
+ *   conn.send_query( "your SQL command" )
+ *   conn.set_chunked_rows_mode(10)
+ *   loop do
+ *     res = conn.get_result or break
+ *     res.check
+ *     res.each do |row|
+ *       # do something with the received max. 10 rows
+ *     end
+ *   end
+ *
+ * Available since PostgreSQL-17
+ */
+static VALUE
+pgconn_set_chunked_rows_mode(VALUE self, VALUE chunk_size)
+{
+	PGconn *conn = pg_get_pgconn(self);
+
+	rb_check_frozen(self);
+	if( PQsetChunkedRowsMode(conn, NUM2INT(chunk_size)) == 0 )
+		pg_raise_conn_error( rb_ePGerror, self, "PQsetChunkedRowsMode %s", PQerrorMessage(conn));
+
+	return self;
+}
+#endif
 
 static VALUE pgconn_send_query_params(int argc, VALUE *argv, VALUE self);
 
@@ -1866,7 +1953,7 @@ pgconn_send_query(int argc, VALUE *argv, VALUE self)
 	/* If called with no or nil parameters, use PQexec for compatibility */
 	if ( argc == 1 || (argc >= 2 && argc <= 4 && NIL_P(argv[1]) )) {
 		if(gvl_PQsendQuery(this->pgconn, pg_cstr_enc(argv[0], this->enc_idx)) == 0)
-			pg_raise_conn_error( rb_eUnableToSend, self, "%s", PQerrorMessage(this->pgconn));
+			pg_raise_conn_error( rb_eUnableToSend, self, "PQsendQuery %s", PQerrorMessage(this->pgconn));
 
 		pgconn_wait_for_flush( self );
 		return Qnil;
@@ -1941,7 +2028,7 @@ pgconn_send_query_params(int argc, VALUE *argv, VALUE self)
 	free_query_params( &paramsData );
 
 	if(result == 0)
-		pg_raise_conn_error( rb_eUnableToSend, self, "%s", PQerrorMessage(this->pgconn));
+		pg_raise_conn_error( rb_eUnableToSend, self, "PQsendQueryParams %s", PQerrorMessage(this->pgconn));
 
 	pgconn_wait_for_flush( self );
 	return Qnil;
@@ -2002,7 +2089,7 @@ pgconn_send_prepare(int argc, VALUE *argv, VALUE self)
 	xfree(paramTypes);
 
 	if(result == 0) {
-		pg_raise_conn_error( rb_eUnableToSend, self, "%s", PQerrorMessage(this->pgconn));
+		pg_raise_conn_error( rb_eUnableToSend, self, "PQsendPrepare %s", PQerrorMessage(this->pgconn));
 	}
 	pgconn_wait_for_flush( self );
 	return Qnil;
@@ -2068,7 +2155,21 @@ pgconn_send_query_prepared(int argc, VALUE *argv, VALUE self)
 	free_query_params( &paramsData );
 
 	if(result == 0)
-		pg_raise_conn_error( rb_eUnableToSend, self, "%s", PQerrorMessage(this->pgconn));
+		pg_raise_conn_error( rb_eUnableToSend, self, "PQsendQueryPrepared %s", PQerrorMessage(this->pgconn));
+
+	pgconn_wait_for_flush( self );
+	return Qnil;
+}
+
+
+static VALUE
+pgconn_send_describe_close_prepared_portal(VALUE self, VALUE name, int (*func)(PGconn *, const char *), const char *funame)
+{
+	t_pg_connection *this = pg_get_connection_safe( self );
+	const char *stmt = NIL_P(name) ? NULL : pg_cstr_enc(name, this->enc_idx);
+	/* returns 0 on failure */
+	if(func(this->pgconn, stmt) == 0)
+		pg_raise_conn_error( rb_eUnableToSend, self, "%s %s", funame, PQerrorMessage(this->pgconn));
 
 	pgconn_wait_for_flush( self );
 	return Qnil;
@@ -2084,13 +2185,9 @@ pgconn_send_query_prepared(int argc, VALUE *argv, VALUE self)
 static VALUE
 pgconn_send_describe_prepared(VALUE self, VALUE stmt_name)
 {
-	t_pg_connection *this = pg_get_connection_safe( self );
-	/* returns 0 on failure */
-	if(gvl_PQsendDescribePrepared(this->pgconn, pg_cstr_enc(stmt_name, this->enc_idx)) == 0)
-		pg_raise_conn_error( rb_eUnableToSend, self, "%s", PQerrorMessage(this->pgconn));
-
-	pgconn_wait_for_flush( self );
-	return Qnil;
+	return pgconn_send_describe_close_prepared_portal(
+		self, stmt_name, gvl_PQsendDescribePrepared,
+		"PQsendDescribePrepared");
 }
 
 
@@ -2104,15 +2201,47 @@ pgconn_send_describe_prepared(VALUE self, VALUE stmt_name)
 static VALUE
 pgconn_send_describe_portal(VALUE self, VALUE portal)
 {
-	t_pg_connection *this = pg_get_connection_safe( self );
-	/* returns 0 on failure */
-	if(gvl_PQsendDescribePortal(this->pgconn, pg_cstr_enc(portal, this->enc_idx)) == 0)
-		pg_raise_conn_error( rb_eUnableToSend, self, "%s", PQerrorMessage(this->pgconn));
-
-	pgconn_wait_for_flush( self );
-	return Qnil;
+	return pgconn_send_describe_close_prepared_portal(
+		self, portal, gvl_PQsendDescribePortal,
+		"PQsendDescribePortal");
 }
 
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+/*
+ * call-seq:
+ *    conn.send_close_prepared( statement_name ) -> nil
+ *
+ * Asynchronously send _command_ to the server. Does not block.
+ * Use in combination with +conn.get_result+.
+ *
+ * Available since PostgreSQL-17.
+ */
+static VALUE
+pgconn_send_close_prepared(VALUE self, VALUE stmt_name)
+{
+	return pgconn_send_describe_close_prepared_portal(
+		self, stmt_name, gvl_PQsendClosePrepared,
+		"PQsendClosePrepared");
+}
+
+
+/*
+ * call-seq:
+ *    conn.send_close_portal( portal_name ) -> nil
+ *
+ * Asynchronously send _command_ to the server. Does not block.
+ * Use in combination with +conn.get_result+.
+ *
+ * Available since PostgreSQL-17.
+ */
+static VALUE
+pgconn_send_close_portal(VALUE self, VALUE portal)
+{
+	return pgconn_send_describe_close_prepared_portal(
+		self, portal, gvl_PQsendClosePortal,
+		"PQsendClosePortal");
+}
+#endif
 
 static VALUE
 pgconn_sync_get_result(VALUE self)
@@ -2203,6 +2332,7 @@ pgconn_sync_flush(VALUE self)
 	return (ret) ? Qfalse : Qtrue;
 }
 
+#ifndef HAVE_PQSETCHUNKEDROWSMODE
 static VALUE
 pgconn_sync_cancel(VALUE self)
 {
@@ -2224,6 +2354,7 @@ pgconn_sync_cancel(VALUE self)
 	PQfreeCancel(cancel);
 	return retval;
 }
+#endif
 
 
 /*
@@ -2270,8 +2401,9 @@ pgconn_notifies(VALUE self)
 static int
 rb_io_descriptor(VALUE io)
 {
+	rb_io_t *fptr;
 	Check_Type(io, T_FILE);
-	rb_io_t *fptr = RFILE(io)->fptr;
+	fptr = RFILE(io)->fptr;
 	rb_io_check_closed(fptr);
 	return fptr->fd;
 }
@@ -2363,7 +2495,7 @@ static VALUE
 pg_rb_io_wait(VALUE io, VALUE events, VALUE timeout) {
 #if defined(HAVE_RUBY_FIBER_SCHEDULER_H)
 	/* We don't support Fiber.scheduler on Windows ruby-3.0 because there is no fast way to check whether a scheduler is active.
-	 * Fortunatelly ruby-3.1 offers a C-API for it.
+	 * Fortunately ruby-3.1 offers a C-API for it.
 	 */
 	VALUE scheduler = rb_fiber_scheduler_current();
 
@@ -2576,7 +2708,7 @@ pgconn_sync_put_copy_data(int argc, VALUE *argv, VALUE self)
 	VALUE value;
 	VALUE buffer = Qnil;
 	VALUE encoder;
-	VALUE intermediate;
+	VALUE intermediate = Qnil;
 	t_pg_coder *p_coder = NULL;
 
 	rb_scan_args( argc, argv, "11", &value, &encoder );
@@ -2615,7 +2747,6 @@ pgconn_sync_put_copy_data(int argc, VALUE *argv, VALUE self)
 	if(ret == -1)
 		pg_raise_conn_error( rb_ePGerror, self, "%s", PQerrorMessage(this->pgconn));
 
-	RB_GC_GUARD(intermediate);
 	RB_GC_GUARD(buffer);
 
 	return (ret) ? Qtrue : Qfalse;
@@ -2710,7 +2841,6 @@ pgconn_set_error_verbosity(VALUE self, VALUE in_verbosity)
 	return INT2FIX(PQsetErrorVerbosity(conn, verbosity));
 }
 
-#ifdef HAVE_PQRESULTVERBOSEERRORMESSAGE
 /*
  * call-seq:
  *    conn.set_error_context_visibility( context_visibility ) -> Integer
@@ -2730,7 +2860,6 @@ pgconn_set_error_verbosity(VALUE self, VALUE in_verbosity)
  *
  * See also corresponding {libpq function}[https://www.postgresql.org/docs/current/libpq-control.html#LIBPQ-PQSETERRORCONTEXTVISIBILITY].
  *
- * Available since PostgreSQL-9.6
  */
 static VALUE
 pgconn_set_error_context_visibility(VALUE self, VALUE in_context_visibility)
@@ -2739,7 +2868,6 @@ pgconn_set_error_context_visibility(VALUE self, VALUE in_context_visibility)
 	PGContextVisibility context_visibility = NUM2INT(in_context_visibility);
 	return INT2FIX(PQsetErrorContextVisibility(conn, context_visibility));
 }
-#endif
 
 /*
  * call-seq:
@@ -3144,7 +3272,9 @@ pgconn_async_get_last_result(VALUE self)
 	for(;;) {
 		int status;
 
-		/* wait for input (without blocking) before reading each result */
+		/* Wait for input before reading each result.
+		 * That way we support the ruby-3.x IO scheduler and don't block other ruby threads.
+		 */
 		wait_socket_readable(self, NULL, get_result_readable);
 
 		cur = gvl_PQgetResult(conn);
@@ -3178,7 +3308,7 @@ pgconn_async_get_last_result(VALUE self)
  * Returns:
  * * +nil+  when the connection is already idle
  * * +true+  when some results have been discarded
- * * +false+  when a failure occured and the connection was closed
+ * * +false+  when a failure occurred and the connection was closed
  *
  */
 static VALUE
@@ -3465,6 +3595,21 @@ pgconn_async_exec_prepared(int argc, VALUE *argv, VALUE self)
 	return rb_pgresult;
 }
 
+static VALUE
+pgconn_async_describe_close_prepared_potral(VALUE self, VALUE name, VALUE
+(*func)(VALUE, VALUE))
+{
+	VALUE rb_pgresult = Qnil;
+
+	pgconn_discard_results( self );
+	func( self, name );
+	rb_pgresult = pgconn_async_get_last_result( self );
+
+	if ( rb_block_given_p() ) {
+		return rb_ensure( rb_yield, rb_pgresult, pg_result_clear, rb_pgresult );
+	}
+	return rb_pgresult;
+}
 
 /*
  * call-seq:
@@ -3477,16 +3622,7 @@ pgconn_async_exec_prepared(int argc, VALUE *argv, VALUE self)
 static VALUE
 pgconn_async_describe_portal(VALUE self, VALUE portal)
 {
-	VALUE rb_pgresult = Qnil;
-
-	pgconn_discard_results( self );
-	pgconn_send_describe_portal( self, portal );
-	rb_pgresult = pgconn_async_get_last_result( self );
-
-	if ( rb_block_given_p() ) {
-		return rb_ensure( rb_yield, rb_pgresult, pg_result_clear, rb_pgresult );
-	}
-	return rb_pgresult;
+	return pgconn_async_describe_close_prepared_potral(self, portal, pgconn_send_describe_portal);
 }
 
 
@@ -3501,27 +3637,64 @@ pgconn_async_describe_portal(VALUE self, VALUE portal)
 static VALUE
 pgconn_async_describe_prepared(VALUE self, VALUE stmt_name)
 {
-	VALUE rb_pgresult = Qnil;
-
-	pgconn_discard_results( self );
-	pgconn_send_describe_prepared( self, stmt_name );
-	rb_pgresult = pgconn_async_get_last_result( self );
-
-	if ( rb_block_given_p() ) {
-		return rb_ensure( rb_yield, rb_pgresult, pg_result_clear, rb_pgresult );
-	}
-	return rb_pgresult;
+	return pgconn_async_describe_close_prepared_potral(self, stmt_name, pgconn_send_describe_prepared);
 }
 
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+/*
+ * call-seq:
+ *    conn.close_prepared( statement_name ) -> PG::Result
+ *
+ * Submits a request to close the specified prepared statement, and waits for completion.
+ * close_prepared allows an application to close a previously prepared statement.
+ * Closing a statement releases all of its associated resources on the server and allows its name to be reused.
+ * It's the same as using the +DEALLOCATE+ SQL statement, but on a lower protocol level.
+ *
+ * +statement_name+ can be "" or +nil+ to reference the unnamed statement.
+ * It is fine if no statement exists with this name, in that case the operation is a no-op.
+ * On success, a PG::Result with status PGRES_COMMAND_OK is returned.
+ *
+ * See also corresponding {libpq function}[https://www.postgresql.org/docs/current/libpq-exec.html#LIBPQ-PQCLOSEPREPARED].
+ *
+ * Available since PostgreSQL-17.
+ */
+static VALUE
+pgconn_async_close_prepared(VALUE self, VALUE stmt_name)
+{
+	return pgconn_async_describe_close_prepared_potral(self, stmt_name, pgconn_send_close_prepared);
+}
 
-#ifdef HAVE_PQSSLATTRIBUTE
+/*
+ * call-seq:
+ *    conn.close_portal( portal_name ) -> PG::Result
+ *
+ * Submits a request to close the specified portal, and waits for completion.
+ *
+ * close_portal allows an application to trigger a close of a previously created portal.
+ * Closing a portal releases all of its associated resources on the server and allows its name to be reused.
+ * (pg does not provide any direct access to portals, but you can use this function to close a cursor created with a DECLARE CURSOR SQL command.)
+ *
+ * +portal_name+ can be "" or +nil+ to reference the unnamed portal.
+ * It is fine if no portal exists with this name, in that case the operation is a no-op.
+ * On success, a PG::Result with status PGRES_COMMAND_OK is returned.
+ *
+ * See also corresponding {libpq function}[https://www.postgresql.org/docs/current/libpq-exec.html#LIBPQ-PQCLOSEPORTAL].
+ *
+ * Available since PostgreSQL-17.
+ */
+static VALUE
+pgconn_async_close_portal(VALUE self, VALUE portal)
+{
+	return pgconn_async_describe_close_prepared_potral(self, portal, pgconn_send_close_portal);
+}
+#endif
+
 /*
  * call-seq:
  *    conn.ssl_in_use? -> Boolean
  *
  * Returns +true+ if the connection uses SSL/TLS, +false+ if not.
  *
- * Available since PostgreSQL-9.5
  */
 static VALUE
 pgconn_ssl_in_use(VALUE self)
@@ -3555,7 +3728,6 @@ pgconn_ssl_in_use(VALUE self)
  *
  * See also #ssl_attribute_names and the {corresponding libpq function}[https://www.postgresql.org/docs/current/libpq-status.html#LIBPQ-PQSSLATTRIBUTE].
  *
- * Available since PostgreSQL-9.5
  */
 static VALUE
 pgconn_ssl_attribute(VALUE self, VALUE attribute_name)
@@ -3574,7 +3746,6 @@ pgconn_ssl_attribute(VALUE self, VALUE attribute_name)
  *
  * See also #ssl_attribute
  *
- * Available since PostgreSQL-9.5
  */
 static VALUE
 pgconn_ssl_attribute_names(VALUE self)
@@ -3589,8 +3760,6 @@ pgconn_ssl_attribute_names(VALUE self)
 	return ary;
 }
 
-
-#endif
 
 
 #ifdef HAVE_PQENTERPIPELINEMODE
@@ -3625,6 +3794,8 @@ pgconn_pipeline_status(VALUE self)
  *
  * Raises PG::Error and has no effect if the connection is not currently idle, i.e., it has a result ready, or it is waiting for more input from the server, etc.
  * This function does not actually send anything to the server, it just changes the libpq connection state.
+ *
+ * See the {PostgreSQL documentation}[https://www.postgresql.org/docs/17/libpq-pipeline-mode.html#LIBPQ-PIPELINE-MODE].
  *
  * Available since PostgreSQL-14
  */
@@ -3664,29 +3835,55 @@ pgconn_exit_pipeline_mode(VALUE self)
 
 /*
  * call-seq:
- *    conn.pipeline_sync -> nil
+ *    conn.sync_pipeline_sync -> nil
  *
- * Marks a synchronization point in a pipeline by sending a sync message and flushing the send buffer.
- * This serves as the delimiter of an implicit transaction and an error recovery point; see Section 34.5.1.3 of the PostgreSQL documentation.
- *
- * Raises PG::Error if the connection is not in pipeline mode or sending a sync message failed.
+ * This function has the same behavior as #async_pipeline_sync, but is implemented using the synchronous command processing API of libpq.
+ * See #async_exec for the differences between the two API variants.
+ * It's not recommended to use explicit sync or async variants but #pipeline_sync instead, unless you have a good reason to do so.
  *
  * Available since PostgreSQL-14
  */
 static VALUE
-pgconn_pipeline_sync(VALUE self)
+pgconn_sync_pipeline_sync(VALUE self)
 {
 	PGconn *conn = pg_get_pgconn(self);
-	int res = PQpipelineSync(conn);
+	int res = gvl_PQpipelineSync(conn);
 	if( res != 1 )
 		pg_raise_conn_error( rb_ePGerror, self, "%s", PQerrorMessage(conn));
 
 	return Qnil;
 }
 
+
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
 /*
  * call-seq:
- *    conn.pipeline_sync -> nil
+ *    conn.send_pipeline_sync -> nil
+ *
+ * Marks a synchronization point in a pipeline by sending a sync message without flushing the send buffer.
+ *
+ * This serves as the delimiter of an implicit transaction and an error recovery point.
+ * Raises PG::Error if the connection is not in pipeline mode or sending a sync message failed.
+ * Note that the message is not itself flushed to the server automatically; use flush if necessary.
+ *
+ * Available since PostgreSQL-17
+ */
+static VALUE
+pgconn_send_pipeline_sync(VALUE self)
+{
+	PGconn *conn = pg_get_pgconn(self);
+	int res = gvl_PQsendPipelineSync(conn);
+	if( res != 1 )
+		pg_raise_conn_error( rb_ePGerror, self, "%s", PQerrorMessage(conn));
+
+	return Qnil;
+}
+#endif
+
+
+/*
+ * call-seq:
+ *    conn.send_flush_request -> nil
  *
  * Sends a request for the server to flush its output buffer.
  *
@@ -4529,7 +4726,9 @@ init_pg_connection(void)
 	rb_define_method(rb_cPGconn, "socket", pgconn_socket, 0);
 	rb_define_method(rb_cPGconn, "socket_io", pgconn_socket_io, 0);
 	rb_define_method(rb_cPGconn, "backend_pid", pgconn_backend_pid, 0);
+#ifndef HAVE_PQSETCHUNKEDROWSMODE
 	rb_define_method(rb_cPGconn, "backend_key", pgconn_backend_key, 0);
+#endif
 	rb_define_method(rb_cPGconn, "connection_needs_password", pgconn_connection_needs_password, 0);
 	rb_define_method(rb_cPGconn, "connection_used_password", pgconn_connection_used_password, 0);
 	/* rb_define_method(rb_cPGconn, "getssl", pgconn_getssl, 0); */
@@ -4541,6 +4740,10 @@ init_pg_connection(void)
 	rb_define_method(rb_cPGconn, "sync_exec_prepared", pgconn_sync_exec_prepared, -1);
 	rb_define_method(rb_cPGconn, "sync_describe_prepared", pgconn_sync_describe_prepared, 1);
 	rb_define_method(rb_cPGconn, "sync_describe_portal", pgconn_sync_describe_portal, 1);
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+	rb_define_method(rb_cPGconn, "sync_close_prepared", pgconn_sync_close_prepared, 1);
+	rb_define_method(rb_cPGconn, "sync_close_portal", pgconn_sync_close_portal, 1);
+#endif
 
 	rb_define_method(rb_cPGconn, "exec", pgconn_async_exec, -1);
 	rb_define_method(rb_cPGconn, "exec_params", pgconn_async_exec_params, -1);
@@ -4548,6 +4751,10 @@ init_pg_connection(void)
 	rb_define_method(rb_cPGconn, "exec_prepared", pgconn_async_exec_prepared, -1);
 	rb_define_method(rb_cPGconn, "describe_prepared", pgconn_async_describe_prepared, 1);
 	rb_define_method(rb_cPGconn, "describe_portal", pgconn_async_describe_portal, 1);
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+	rb_define_method(rb_cPGconn, "close_prepared", pgconn_async_close_prepared, 1);
+	rb_define_method(rb_cPGconn, "close_portal", pgconn_async_close_portal, 1);
+#endif
 
 	rb_define_alias(rb_cPGconn, "async_exec", "exec");
 	rb_define_alias(rb_cPGconn, "async_query", "async_exec");
@@ -4556,6 +4763,10 @@ init_pg_connection(void)
 	rb_define_alias(rb_cPGconn, "async_exec_prepared", "exec_prepared");
 	rb_define_alias(rb_cPGconn, "async_describe_prepared", "describe_prepared");
 	rb_define_alias(rb_cPGconn, "async_describe_portal", "describe_portal");
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+	rb_define_alias(rb_cPGconn, "async_close_prepared", "close_prepared");
+	rb_define_alias(rb_cPGconn, "async_close_portal", "close_portal");
+#endif
 
 	rb_define_method(rb_cPGconn, "make_empty_pgresult", pgconn_make_empty_pgresult, 1);
 	rb_define_method(rb_cPGconn, "escape_string", pgconn_s_escape, 1);
@@ -4565,6 +4776,9 @@ init_pg_connection(void)
 	rb_define_method(rb_cPGconn, "escape_bytea", pgconn_s_escape_bytea, 1);
 	rb_define_method(rb_cPGconn, "unescape_bytea", pgconn_s_unescape_bytea, 1);
 	rb_define_method(rb_cPGconn, "set_single_row_mode", pgconn_set_single_row_mode, 0);
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+	rb_define_method(rb_cPGconn, "set_chunked_rows_mode", pgconn_set_chunked_rows_mode, 1);
+#endif
 
 	/******     PG::Connection INSTANCE METHODS: Asynchronous Command Processing     ******/
 	rb_define_method(rb_cPGconn, "send_query", pgconn_send_query, -1);
@@ -4584,7 +4798,9 @@ init_pg_connection(void)
 	rb_define_method(rb_cPGconn, "discard_results", pgconn_discard_results, 0);
 
 	/******     PG::Connection INSTANCE METHODS: Cancelling Queries in Progress     ******/
+#ifndef HAVE_PQSETCHUNKEDROWSMODE
 	rb_define_method(rb_cPGconn, "sync_cancel", pgconn_sync_cancel, 0);
+#endif
 
 	/******     PG::Connection INSTANCE METHODS: NOTIFY     ******/
 	rb_define_method(rb_cPGconn, "notifies", pgconn_notifies, 0);
@@ -4596,9 +4812,7 @@ init_pg_connection(void)
 
 	/******     PG::Connection INSTANCE METHODS: Control Functions     ******/
 	rb_define_method(rb_cPGconn, "set_error_verbosity", pgconn_set_error_verbosity, 1);
-#ifdef HAVE_PQRESULTVERBOSEERRORMESSAGE
 	rb_define_method(rb_cPGconn, "set_error_context_visibility", pgconn_set_error_context_visibility, 1 );
-#endif
 	rb_define_method(rb_cPGconn, "trace", pgconn_trace, 1);
 	rb_define_method(rb_cPGconn, "untrace", pgconn_untrace, 0);
 
@@ -4620,22 +4834,21 @@ init_pg_connection(void)
 	rb_define_method(rb_cPGconn, "sync_get_last_result", pgconn_sync_get_last_result, 0);
 	rb_define_method(rb_cPGconn, "get_last_result", pgconn_async_get_last_result, 0);
 	rb_define_alias(rb_cPGconn, "async_get_last_result", "get_last_result");
-#ifdef HAVE_PQENCRYPTPASSWORDCONN
 	rb_define_method(rb_cPGconn, "sync_encrypt_password", pgconn_sync_encrypt_password, -1);
-#endif
 
-#ifdef HAVE_PQSSLATTRIBUTE
 	rb_define_method(rb_cPGconn, "ssl_in_use?", pgconn_ssl_in_use, 0);
 	rb_define_method(rb_cPGconn, "ssl_attribute", pgconn_ssl_attribute, 1);
 	rb_define_method(rb_cPGconn, "ssl_attribute_names", pgconn_ssl_attribute_names, 0);
-#endif
 
 #ifdef HAVE_PQENTERPIPELINEMODE
 	rb_define_method(rb_cPGconn, "pipeline_status", pgconn_pipeline_status, 0);
 	rb_define_method(rb_cPGconn, "enter_pipeline_mode", pgconn_enter_pipeline_mode, 0);
 	rb_define_method(rb_cPGconn, "exit_pipeline_mode", pgconn_exit_pipeline_mode, 0);
-	rb_define_method(rb_cPGconn, "pipeline_sync", pgconn_pipeline_sync, 0);
+	rb_define_method(rb_cPGconn, "sync_pipeline_sync", pgconn_sync_pipeline_sync, 0);
 	rb_define_method(rb_cPGconn, "send_flush_request", pgconn_send_flush_request, 0);
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+	rb_define_method(rb_cPGconn, "send_pipeline_sync", pgconn_send_pipeline_sync, 0);
+#endif
 #endif
 
 	/******     PG::Connection INSTANCE METHODS: Large Object Support     ******/

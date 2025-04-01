@@ -133,7 +133,7 @@ describe YSQL::Result do
 
 		it "can iterate over all rows as Hash" do
 			@conn.send_query( "SELECT generate_series(2,4) AS a; SELECT 1 AS b, generate_series(5,6) AS c" )
-			@conn.set_single_row_mode
+			@conn.send(*row_mode)
 			expect(
 				@conn.get_result.stream_each.to_a
 			).to eq(
@@ -161,20 +161,20 @@ describe YSQL::Result do
 		end
 
 		it "keeps last result on error while iterating stream_each" do
-			@conn.send_query( "SELECT generate_series(2,4) AS a" )
-			@conn.set_single_row_mode
+			@conn.send_query( "SELECT generate_series(2,6) AS a" )
+			@conn.send(*row_mode)
 			res = @conn.get_result
 			expect do
 				res.stream_each_row do
 					raise ZeroDivisionError
 				end
 			end.to raise_error(ZeroDivisionError)
-			expect( res.values ).to eq([["2"]])
+			expect( res.values ).to eq(mode_name==:single ? [["2"]] : [["2"], ["3"], ["4"]])
 		end
 
 		it "can iterate over all rows as Array" do
 			@conn.send_query( "SELECT generate_series(2,4) AS a; SELECT 1 AS b, generate_series(5,6) AS c" )
-			@conn.set_single_row_mode
+			@conn.send(*row_mode)
 			expect(
 				@conn.get_result.enum_for(:stream_each_row).to_a
 			).to eq(
@@ -189,20 +189,20 @@ describe YSQL::Result do
 		end
 
 		it "keeps last result on error while iterating stream_each_row" do
-			@conn.send_query( "SELECT generate_series(2,4) AS a" )
-			@conn.set_single_row_mode
+			@conn.send_query( "SELECT generate_series(2,6) AS a" )
+			@conn.send(*row_mode)
 			res = @conn.get_result
 			expect do
 				res.stream_each_row do
 					raise ZeroDivisionError
 				end
 			end.to raise_error(ZeroDivisionError)
-			expect( res.values ).to eq([["2"]])
+			expect( res.values ).to eq(mode_name==:single ? [["2"]] : [["2"], ["3"], ["4"]])
 		end
 
 		it "can iterate over all rows as PG::Tuple" do
 			@conn.send_query( "SELECT generate_series(2,4) AS a; SELECT 1 AS b, generate_series(5,6) AS c" )
-			@conn.set_single_row_mode
+			@conn.send(*row_mode)
 			tuples = @conn.get_result.stream_each_tuple.to_a
 			expect( tuples[0][0] ).to eq( "2" )
 			expect( tuples[1]["a"] ).to eq( "3" )
@@ -218,7 +218,7 @@ describe YSQL::Result do
 
 		it "clears result on error while iterating stream_each_tuple" do
 			@conn.send_query( "SELECT generate_series(2,4) AS a" )
-			@conn.set_single_row_mode
+			@conn.send(*row_mode)
 			res = @conn.get_result
 			expect do
 				res.stream_each_tuple do
@@ -230,7 +230,7 @@ describe YSQL::Result do
 
 		it "should reuse field names in stream_each_tuple" do
 			@conn.send_query( "SELECT generate_series(2,3) AS a" )
-			@conn.set_single_row_mode
+			@conn.send(*row_mode)
 			tuple1, tuple2 = *@conn.get_result.stream_each_tuple.to_a
 			expect( tuple1.keys[0].object_id ).to eq(tuple2.keys[0].object_id)
 		end
@@ -248,7 +248,7 @@ describe YSQL::Result do
 
 		it "can handle commands not returning tuples" do
 			@conn.send_query( "CREATE TEMP TABLE test_single_row_mode (a int)" )
-			@conn.set_single_row_mode
+			@conn.send(*row_mode)
 			res1 = @conn.get_result
 			res2 = res1.stream_each_tuple { raise "this shouldn't be called" }
 			expect( res2 ).to be_equal( res1 )
@@ -306,7 +306,7 @@ describe YSQL::Result do
 
 		it "should deny streaming when frozen" do
 			@conn.send_query( "SELECT 1" )
-			@conn.set_single_row_mode
+			@conn.send(*row_mode)
 			res = @conn.get_result.freeze
 			expect{
 				res.stream_each_row
@@ -350,7 +350,7 @@ describe YSQL::Result do
 		).to match( /^parserOpenTable$|^RangeVarGetRelid$/ )
 	end
 
-	it "encapsulates PG_DIAG_SEVERITY_NONLOCALIZED error in a PG::Error object", :postgresql_96 do
+	it "encapsulates PG_DIAG_SEVERITY_NONLOCALIZED error in a PG::Error object" do
 		result = nil
 		begin
 			@conn.exec( "SELECT * FROM nonexistant_table" )
@@ -395,7 +395,7 @@ describe YSQL::Result do
 		expect( res.result_error_message ).to match(/"xyz"/)
 	end
 
-	it "provides a verbose error message", :postgresql_96 do
+	it "provides a verbose error message" do
 		@conn.send_query("SELECT xyz")
 		res = @conn.get_result; @conn.get_result
 		# PQERRORS_TERSE should give a single line result
@@ -627,7 +627,7 @@ describe YSQL::Result do
 	end
 
 	it "can be manually checked for failed result status (async API)" do
-		@conn.send_query( "SELECT * FROM nonexistant_table" )
+		@conn.send_query( "SELECT * FROM nonexistent_table" )
 		res = @conn.get_result
 		expect {
 			res.check
@@ -661,7 +661,7 @@ describe YSQL::Result do
 		expect{ res.tuple("x") }.to raise_error(TypeError)
 	end
 
-	it "raises a proper exception for a nonexistant table" do
+	it "raises a proper exception for a nonexistent table" do
 		expect {
 			@conn.exec( "SELECT * FROM nonexistant_table" )
 		}.to raise_error(YSQL::UndefinedTable, /relation "nonexistant_table" does not exist/ )
@@ -671,7 +671,7 @@ describe YSQL::Result do
 		old_error = YSQL::ERROR_CLASSES.delete('42P01')
 		begin
 			expect {
-				@conn.exec( "SELECT * FROM nonexistant_table" )
+				@conn.exec( "SELECT * FROM nonexistent_table" )
 			}.to raise_error{|error|
 				expect( error ).to be_an_instance_of(YSQL::SyntaxErrorOrAccessRuleViolation)
 				expect( error.to_s ).to match(/relation "nonexistant_table" does not exist/)
@@ -686,7 +686,7 @@ describe YSQL::Result do
 		old_error2 = YSQL::ERROR_CLASSES.delete('42')
 		begin
 			expect {
-				@conn.exec( "SELECT * FROM nonexistant_table" )
+				@conn.exec( "SELECT * FROM nonexistent_table" )
 			}.to raise_error{|error|
 				expect( error ).to be_an_instance_of(YSQL::ServerError)
 				expect( error.to_s ).to match(/relation "nonexistant_table" does not exist/)
@@ -697,7 +697,7 @@ describe YSQL::Result do
 		end
 	end
 
-	it "raises a proper exception for a nonexistant schema" do
+	it "raises a proper exception for a nonexistent schema" do
 		expect {
 			@conn.exec( "DROP SCHEMA nonexistant_schema" )
 		}.to raise_error(YSQL::InvalidSchemaName, /schema "nonexistant_schema" does not exist/ )

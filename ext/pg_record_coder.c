@@ -43,7 +43,7 @@ static const rb_data_type_t pg_recordcoder_type = {
 		pg_recordcoder_mark,
 		RUBY_TYPED_DEFAULT_FREE,
 		pg_recordcoder_memsize,
-		pg_compact_callback(pg_recordcoder_compact),
+		pg_recordcoder_compact,
 	},
 	&pg_coder_type,
 	0,
@@ -198,7 +198,7 @@ pg_text_enc_record(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate
 		char *ptr1;
 		char *ptr2;
 		long strlen;
-		int backslashs;
+		int backslashes;
 		VALUE subint;
 		VALUE entry;
 
@@ -249,19 +249,19 @@ pg_text_enc_record(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate
 					ptr2 = current_out + strlen;
 
 					/* count required backlashs */
-					for(backslashs = 0; ptr1 != ptr2; ptr1++) {
+					for(backslashes = 0; ptr1 != ptr2; ptr1++) {
 						/* Escape backslash itself, newline, carriage return, and the current delimiter character. */
 						if(*ptr1 == '"' || *ptr1 == '\\'){
-							backslashs++;
+							backslashes++;
 						}
 					}
 
 					ptr1 = current_out + strlen;
-					ptr2 = current_out + strlen + backslashs;
+					ptr2 = current_out + strlen + backslashes;
 					current_out = ptr2;
 
 					/* Then store the escaped string on the final position, walking
-					 * right to left, until all backslashs are placed. */
+					 * right to left, until all backslashes are placed. */
 					while( ptr1 != ptr2 ) {
 						*--ptr2 = *--ptr1;
 						if(*ptr1 == '"' || *ptr1 == '\\'){
@@ -340,7 +340,7 @@ record_isspace(char ch)
  *   conn.exec("SELECT * FROM my_table").map_types!(PG::TypeMapByColumn.new([deco]*2)).to_a
  *   # => [{"v1"=>[2.0, 3.0], "v2"=>[4.0, 5.0]}, {"v1"=>[6.0, 7.0], "v2"=>[8.0, 9.0]}]
  *
- * It's more very convenient to use the PG::BasicTypeRegistry, which is based on database OIDs.
+ * It's more convenient to use the PG::BasicTypeRegistry, which is based on database OIDs.
  *   # Fetch a NULL record of our type to retrieve the OIDs of the two fields "r" and "i"
  *   oids = conn.exec( "SELECT (NULL::complex).*" )
  *   # Build a type map (PG::TypeMapByColumn) for decoding the "complex" type

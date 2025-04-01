@@ -131,7 +131,7 @@ class YSQL::Connection
 		return str
 	end
 
-	BinarySignature = "PGCOPY\n\377\r\n\0".b
+	BinarySignature = "PGCOPY\n\377\r\n\0"
 	private_constant :BinarySignature
 
 	#  call-seq:
@@ -180,7 +180,10 @@ class YSQL::Connection
 	#     conn.put_copy_data ['more', 'data', 'to', 'copy']
 	#   end
 	#
-	# Also PG::BinaryEncoder::CopyRow can be used to send data in binary format to the server.
+	# All 4 CopyRow classes can take a type map to specify how the columns are mapped to and from the database format.
+	# For details see the particular CopyRow class description.
+	#
+	# PG::BinaryEncoder::CopyRow can be used to send data in binary format to the server.
 	# In this case copy_data generates the header and trailer data automatically:
 	#   enco = PG::BinaryEncoder::CopyRow.new
 	#   conn.copy_data "COPY my_table FROM STDIN (FORMAT binary)", enco do
@@ -334,6 +337,11 @@ class YSQL::Connection
 		rollback = false
 		exec "BEGIN"
 		yield(self)
+	rescue PG::RollbackTransaction
+		rollback = true
+		cancel if transaction_status == PG::PQTRANS_ACTIVE
+		block
+		exec "ROLLBACK"
 	rescue Exception
 		rollback = true
 		cancel if transaction_status == YSQL::PQTRANS_ACTIVE
@@ -383,21 +391,18 @@ class YSQL::Connection
 		end
 	end
 
-	# Method 'ssl_attribute' was introduced in PostgreSQL 9.5.
-	if self.instance_methods.find{|m| m.to_sym == :ssl_attribute }
-		# call-seq:
-		#   conn.ssl_attributes -> Hash<String,String>
-		#
-		# Returns SSL-related information about the connection as key/value pairs
-		#
-		# The available attributes varies depending on the SSL library being used,
-		# and the type of connection.
-		#
-		# See also #ssl_attribute
-		def ssl_attributes
-			ssl_attribute_names.each.with_object({}) do |n,h|
-				h[n] = ssl_attribute(n)
-			end
+	# call-seq:
+	#   conn.ssl_attributes -> Hash<String,String>
+	#
+	# Returns SSL-related information about the connection as key/value pairs
+	#
+	# The available attributes varies depending on the SSL library being used,
+	# and the type of connection.
+	#
+	# See also #ssl_attribute
+	def ssl_attributes
+		ssl_attribute_names.each.with_object({}) do |n,h|
+			h[n] = ssl_attribute(n)
 		end
 	end
 
@@ -528,7 +533,7 @@ class YSQL::Connection
 	# See also #copy_data.
 	#
 	def put_copy_data(buffer, encoder=nil)
-		# sync_put_copy_data does a non-blocking attept to flush data.
+		# sync_put_copy_data does a non-blocking attempt to flush data.
 		until res=sync_put_copy_data(buffer, encoder)
 			# It didn't flush immediately and allocation of more buffering memory failed.
 			# Wait for all data sent by doing a blocking flush.
@@ -566,6 +571,25 @@ class YSQL::Connection
 	end
 	alias async_put_copy_end put_copy_end
 
+	if method_defined? :send_pipeline_sync
+		# call-seq:
+		#    conn.pipeline_sync
+		#
+		# Marks a synchronization point in a pipeline by sending a sync message and flushing the send buffer.
+		# This serves as the delimiter of an implicit transaction and an error recovery point.
+		#
+		# See enter_pipeline_mode
+		#
+		# Raises PG::Error if the connection is not in pipeline mode or sending a sync message failed.
+		#
+		# Available since PostgreSQL-14
+		def pipeline_sync(*args)
+			send_pipeline_sync(*args)
+			flush
+		end
+		alias async_pipeline_sync pipeline_sync
+	end
+
 	if method_defined? :sync_encrypt_password
 		# call-seq:
 		#    conn.encrypt_password( password, username, algorithm=nil ) -> String
@@ -600,6 +624,8 @@ class YSQL::Connection
 	# Resets the backend connection. This method closes the
 	# backend connection and tries to re-connect.
 	def reset
+		# Use connection options from PG::Connection.new to reconnect with the same options but with renewed DNS resolution.
+		# Use conninfo_hash as a fallback when connect_start was used to create the connection object.
 		iopts = conninfo_hash.compact
 		if iopts[:host] && !iopts[:host].empty? && YSQL.library_version >= 100000
 			iopts = self.class.send(:resolve_hosts, iopts)
@@ -611,130 +637,144 @@ class YSQL::Connection
 	end
 	alias async_reset reset
 
-	# call-seq:
-	#    conn.cancel() -> String
-	#
-	# Requests cancellation of the command currently being
-	# processed.
-	#
-	# Returns +nil+ on success, or a string containing the
-	# error message if a failure occurs.
-	def cancel
-		be_pid = backend_pid
-		be_key = backend_key
-		cancel_request = [0x10, 1234, 5678, be_pid, be_key].pack("NnnNN")
+	if defined?(YSQL::CancelConnection)
+		# PostgreSQL-17+
 
-		if Fiber.respond_to?(:scheduler) && Fiber.scheduler && RUBY_PLATFORM =~ /mingw|mswin/
-			# Ruby's nonblocking IO is not really supported on Windows.
-			# We work around by using threads and explicit calls to wait_readable/wait_writable.
-			cl = Thread.new(socket_io.remote_address) { |ra| ra.connect }.value
-			begin
-				cl.write_nonblock(cancel_request)
-			rescue IO::WaitReadable, Errno::EINTR
-				cl.wait_writable
-				retry
-			end
-			begin
-				cl.read_nonblock(1)
-			rescue IO::WaitReadable, Errno::EINTR
-				cl.wait_readable
-				retry
-			rescue EOFError
-			end
-		elsif RUBY_ENGINE == 'truffleruby'
-			begin
-				cl = socket_io.remote_address.connect
-			rescue NotImplementedError
-				# Workaround for truffleruby < 21.3.0
-				cl2 = Socket.for_fd(socket_io.fileno)
-				cl2.autoclose = false
-				adr = cl2.remote_address
-				if adr.ip?
-					cl = TCPSocket.new(adr.ip_address, adr.ip_port)
-					cl.autoclose = false
-				else
-					cl = UNIXSocket.new(adr.unix_path)
-					cl.autoclose = false
-				end
-			end
-			cl.write(cancel_request)
-			cl.read(1)
-		else
-			cl = socket_io.remote_address.connect
-			# Send CANCEL_REQUEST_CODE and parameters
-			cl.write(cancel_request)
-			# Wait for the postmaster to close the connection, which indicates that it's processed the request.
-			cl.read(1)
+		def sync_cancel
+			cancon = YSQL::CancelConnection.new(self)
+			cancon.sync_cancel
+		rescue YSQL::Error => err
+			err.to_s
 		end
 
-		cl.close
-		nil
-	rescue SystemCallError => err
-		err.to_s
+		# call-seq:
+		#    conn.cancel() -> String
+		#
+		# Requests cancellation of the command currently being
+		# processed.
+		#
+		# Returns +nil+ on success, or a string containing the
+		# error message if a failure occurs.
+		#
+		# On PostgreSQL-17+ client libaray the class YSQL::CancelConnection is used.
+		# On older client library a pure ruby implementation is used.
+		def cancel
+			cancon = YSQL::CancelConnection.new(self)
+			cancon.async_connect_timeout = conninfo_hash[:connect_timeout]
+			cancon.async_cancel
+		rescue YSQL::Error => err
+			err.to_s
+		end
+
+	else
+
+		# PostgreSQL < 17
+
+		def cancel
+			be_pid = backend_pid
+			be_key = backend_key
+			cancel_request = [0x10, 1234, 5678, be_pid, be_key].pack("NnnNN")
+
+			if Fiber.respond_to?(:scheduler) && Fiber.scheduler && RUBY_PLATFORM =~ /mingw|mswin/
+				# Ruby's nonblocking IO is not really supported on Windows.
+				# We work around by using threads and explicit calls to wait_readable/wait_writable.
+				cl = Thread.new(socket_io.remote_address) { |ra| ra.connect }.value
+				begin
+					cl.write_nonblock(cancel_request)
+				rescue IO::WaitReadable, Errno::EINTR
+					cl.wait_writable
+					retry
+				end
+				begin
+					cl.read_nonblock(1)
+				rescue IO::WaitReadable, Errno::EINTR
+					cl.wait_readable
+					retry
+				rescue EOFError
+				end
+			else
+				cl = socket_io.remote_address.connect
+				# Send CANCEL_REQUEST_CODE and parameters
+				cl.write(cancel_request)
+				# Wait for the postmaster to close the connection, which indicates that it's processed the request.
+				cl.read(1)
+			end
+
+			cl.close
+			nil
+		rescue SystemCallError => err
+			err.to_s
+		end
 	end
 	alias async_cancel cancel
 
+	module Pollable
+		# Track the progress of the connection, waiting for the socket to become readable/writable before polling it
+		private def polling_loop(poll_meth, connect_timeout)
+			if (timeo = connect_timeout.to_i) && timeo > 0
+				host_count = conninfo_hash[:host].to_s.count(",") + 1
+				stop_time = timeo * host_count + Process.clock_gettime(Process::CLOCK_MONOTONIC)
+			end
+
+			poll_status = PG::PGRES_POLLING_WRITING
+			until poll_status == PG::PGRES_POLLING_OK ||
+					poll_status == PG::PGRES_POLLING_FAILED
+
+				# Set single timeout to parameter "connect_timeout" but
+				# don't exceed total connection time of number-of-hosts * connect_timeout.
+				timeout = [timeo, stop_time - Process.clock_gettime(Process::CLOCK_MONOTONIC)].min if stop_time
+				event = if !timeout || timeout >= 0
+					# If the socket needs to read, wait 'til it becomes readable to poll again
+					case poll_status
+					when YSQL::PGRES_POLLING_READING
+						if defined?(IO::READABLE) # ruby-3.0+
+							socket_io.wait(IO::READABLE | IO::PRIORITY, timeout)
+						else
+							IO.select([socket_io], nil, [socket_io], timeout)
+						end
+
+					# ...and the same for when the socket needs to write
+					when YSQL::PGRES_POLLING_WRITING
+						if defined?(IO::WRITABLE) # ruby-3.0+
+							# Use wait instead of wait_readable, since connection errors are delivered as
+							# exceptional/priority events on Windows.
+							socket_io.wait(IO::WRITABLE | IO::PRIORITY, timeout)
+						else
+							# io#wait on ruby-2.x doesn't wait for priority, so fallback to IO.select
+							IO.select(nil, [socket_io], [socket_io], timeout)
+						end
+					end
+				end
+				# connection to server at "localhost" (127.0.0.1), port 5433 failed: timeout expired (PG::ConnectionBad)
+				# connection to server on socket "/var/run/postgresql/.s.PGSQL.5433" failed: No such file or directory
+				unless event
+					if self.class.send(:host_is_named_pipe?, host)
+						connhost = "on socket \"#{host}\""
+					elsif respond_to?(:hostaddr)
+						connhost = "at \"#{host}\" (#{hostaddr}), port #{port}"
+					else
+						connhost = "at \"#{host}\", port #{port}"
+					end
+					raise YSQL::ConnectionBad.new("connection to server #{connhost} failed: timeout expired", connection: self)
+				end
+
+				# Check to see if it's finished or failed yet
+				poll_status = send( poll_meth )
+			end
+
+			unless status == PG::CONNECTION_OK
+				msg = error_message
+				finish
+				raise YSQL::ConnectionBad.new(msg, connection: self)
+			end
+		end
+	end
+
+	include Pollable
+
 	private def async_connect_or_reset(poll_meth)
 		# Track the progress of the connection, waiting for the socket to become readable/writable before polling it
-
-		if (timeo = conninfo_hash[:connect_timeout].to_i) && timeo > 0
-			# Lowest timeout is 2 seconds - like in libpq
-			timeo = [timeo, 2].max
-			host_count = conninfo_hash[:host].to_s.count(",") + 1
-			stop_time = timeo * host_count + Process.clock_gettime(Process::CLOCK_MONOTONIC)
-		end
-
-		poll_status = YSQL::PGRES_POLLING_WRITING
-		until poll_status == YSQL::PGRES_POLLING_OK ||
-				poll_status == YSQL::PGRES_POLLING_FAILED
-
-			# Set single timeout to parameter "connect_timeout" but
-			# don't exceed total connection time of number-of-hosts * connect_timeout.
-			timeout = [timeo, stop_time - Process.clock_gettime(Process::CLOCK_MONOTONIC)].min if stop_time
-			event = if !timeout || timeout >= 0
-				# If the socket needs to read, wait 'til it becomes readable to poll again
-				case poll_status
-				when YSQL::PGRES_POLLING_READING
-					if defined?(IO::READABLE) # ruby-3.0+
-						socket_io.wait(IO::READABLE | IO::PRIORITY, timeout)
-					else
-						IO.select([socket_io], nil, [socket_io], timeout)
-					end
-
-				# ...and the same for when the socket needs to write
-				when YSQL::PGRES_POLLING_WRITING
-					if defined?(IO::WRITABLE) # ruby-3.0+
-						# Use wait instead of wait_readable, since connection errors are delivered as
-						# exceptional/priority events on Windows.
-						socket_io.wait(IO::WRITABLE | IO::PRIORITY, timeout)
-					else
-						# io#wait on ruby-2.x doesn't wait for priority, so fallback to IO.select
-						IO.select(nil, [socket_io], [socket_io], timeout)
-					end
-				end
-			end
-			# connection to server at "localhost" (127.0.0.1), port 5433 failed: timeout expired (PG::ConnectionBad)
-			# connection to server on socket "/var/run/postgresql/.s.PGSQL.5433" failed: No such file or directory
-			unless event
-				if self.class.send(:host_is_named_pipe?, host)
-					connhost = "on socket \"#{host}\""
-				elsif respond_to?(:hostaddr)
-					connhost = "at \"#{host}\" (#{hostaddr}), port #{port}"
-				else
-					connhost = "at \"#{host}\", port #{port}"
-				end
-				raise YSQL::ConnectionBad.new("connection to server #{connhost} failed: timeout expired", connection: self)
-			end
-
-			# Check to see if it's finished or failed yet
-			poll_status = send( poll_meth )
-		end
-
-		unless status == YSQL::CONNECTION_OK
-			msg = error_message
-			finish
-			raise YSQL::ConnectionBad.new(msg, connection: self)
-		end
+		polling_loop(poll_meth, conninfo_hash[:connect_timeout])
 
 		# Set connection to nonblocking to handle all blocking states in ruby.
 		# That way a fiber scheduler is able to handle IO requests.
@@ -881,6 +921,8 @@ class YSQL::Connection
 
 			raise YSQL::ConnectionBad, conn.error_message if conn.status == YSQL::CONNECTION_BAD
 
+			# save the connection options for conn.reset
+			conn.instance_variable_set(:@iopts_for_reset, iopts_for_reset)
 			conn.send(:async_connect_or_reset, :connect_poll)
 			conn
 		end
@@ -945,6 +987,22 @@ class YSQL::Connection
 			:flush => [:async_flush, :sync_flush],
 		})
 		private_constant :REDIRECT_SEND_METHODS
+		
+		if YSQL::Connection.instance_methods.include? :sync_pipeline_sync
+			if YSQL::Connection.instance_methods.include? :send_pipeline_sync
+				# PostgreSQL-17+
+				REDIRECT_SEND_METHODS.merge!({
+					:pipeline_sync => [:async_pipeline_sync, :sync_pipeline_sync],
+				})
+			else
+				# PostgreSQL-14+
+				REDIRECT_SEND_METHODS.merge!({
+					:pipeline_sync => [:sync_pipeline_sync, :sync_pipeline_sync],
+				})
+			end
+		end
+		YSQL.make_shareable(REDIRECT_SEND_METHODS)
+
 		REDIRECT_METHODS = {
 			:exec => [:async_exec, :sync_exec],
 			:query => [:async_exec, :sync_exec],
@@ -961,14 +1019,22 @@ class YSQL::Connection
 			:set_client_encoding => [:async_set_client_encoding, :sync_set_client_encoding],
 			:client_encoding= => [:async_set_client_encoding, :sync_set_client_encoding],
 			:cancel => [:async_cancel, :sync_cancel],
+			:encrypt_password => [:async_encrypt_password, :sync_encrypt_password],
 		}
 		private_constant :REDIRECT_METHODS
 
+		if YSQL::Connection.instance_methods.include? :async_close_prepared
+			REDIRECT_METHODS.merge!({
+				:close_prepared => [:async_close_prepared, :sync_close_prepared],
+				:close_portal => [:async_close_portal, :sync_close_portal],
+			})
+		end
 		if YSQL::Connection.instance_methods.include? :async_encrypt_password
 			REDIRECT_METHODS.merge!({
 				:encrypt_password => [:async_encrypt_password, :sync_encrypt_password],
 			})
 		end
+
 		YSQL.make_shareable(REDIRECT_METHODS)
 
 		def async_send_api=(enable)

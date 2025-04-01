@@ -1,4 +1,3 @@
-
 # -*- ruby -*-
 # frozen_string_literal: true
 
@@ -6,11 +5,12 @@
 module YSQL
 
 	# Is this file part of a fat binary gem with bundled libpq?
-	bundled_libpq_path = File.join(__dir__, RUBY_PLATFORM.gsub(/^i386-/, "x86-"))
-	if File.exist?(bundled_libpq_path)
+	# This path must be enabled by add_dll_directory on Windows.
+	gplat = Gem::Platform.local
+	bundled_libpq_path = Dir[File.expand_path("../ports/#{gplat.cpu}-#{gplat.os}*/lib", __dir__)].first
+	if bundled_libpq_path
 		POSTGRESQL_LIB_PATH = bundled_libpq_path
 	else
-		bundled_libpq_path = nil
 		# Try to load libpq path as found by extconf.rb
 		begin
 			require "ysql/postgresql_lib_path"
@@ -22,7 +22,8 @@ module YSQL
 	end
 
 	add_dll_path = proc do |path, &block|
-		if RUBY_PLATFORM =~/(mswin|mingw)/i && path && File.exist?(path)
+		if RUBY_PLATFORM =~/(mswin|mingw)/i && path
+			BUNDLED_LIBPQ_WITH_UNIXSOCKET = false
 			begin
 				require 'ruby_installer/runtime'
 				RubyInstaller::Runtime.add_dll_directory(path, &block)
@@ -33,19 +34,22 @@ module YSQL
 				ENV['PATH'] = old_path
 			end
 		else
-			# No need to set a load path manually - it's set as library rpath.
+			# libpq is found by a relative rpath in the cross compiled extension dll
+			# or by the system library loader
 			block.call
+			BUNDLED_LIBPQ_WITH_UNIXSOCKET = RUBY_PLATFORM=~/linux/i && YSQL::IS_BINARY_GEM
 		end
 	end
 
 	# Add a load path to the one retrieved from pg_config
 	add_dll_path.call(POSTGRESQL_LIB_PATH) do
-		if bundled_libpq_path
-			# It's a Windows binary gem, try the <major>.<minor> subdirectory
+		begin
+			# Try the <major>.<minor> subdirectory for fat binary gems
 			major_minor = RUBY_VERSION[ /^(\d+\.\d+)/ ] or
 				raise "Oops, can't extract the major/minor version from #{RUBY_VERSION.dump}"
+			
 			require "#{major_minor}/ysql_ext"
-		else
+		rescue LoadError
 			require 'ysql_ext'
 		end
 	end
@@ -116,7 +120,6 @@ module YSQL
 	require 'ysql/load_balance_service'
 	autoload :VERSION, 'ysql/version'
 
-
 	# Avoid "uninitialized constant Truffle::WarningOperations" on Truffleruby up to 22.3.1
 	if RUBY_ENGINE=="truffleruby" && !defined?(Truffle::WarningOperations)
 		module TruffleFixWarn
@@ -125,6 +128,16 @@ module YSQL
 			end
 		end
 		Warning.extend(TruffleFixWarn)
+	end
+
+	# Ruby-3.4+ prints a warning, if bigdecimal is required but not in the Gemfile.
+	# But it's a false positive, since we enable bigdecimal depending features only if it's available.
+	# And most people don't need these features.
+	def self.require_bigdecimal_without_warning
+		oldverb, $VERBOSE = $VERBOSE, nil
+		require "bigdecimal"
+	ensure
+		$VERBOSE = oldverb
 	end
 
 end # module PG

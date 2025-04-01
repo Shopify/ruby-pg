@@ -167,7 +167,7 @@ class YSQL::BasicTypeMapForQueries < YSQL::TypeMapByClass
 	end
 
 	begin
-		require "bigdecimal"
+		PG.require_bigdecimal_without_warning
 		has_bigdecimal = true
 	rescue LoadError
 	end

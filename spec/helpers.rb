@@ -247,31 +247,32 @@ module YSQL::TestingHelpers
 		attr_reader :port
 		attr_reader :conninfo
 		attr_reader :unix_socket
+		attr_reader :pgdata
 
 		### Set up a PostgreSQL database instance for testing.
-		def initialize( name, port: 54321, postgresql_conf: '' )
+		def initialize( name, port: 23456, postgresql_conf: '' )
 			trace "Setting up test database for #{name}"
 			@name = name
 			@port = port
 			@test_dir = TEST_DIRECTORY + "tmp_test_#{@name}"
-			@test_pgdata = @test_dir + 'data'
-			@test_pgdata.mkpath
+			@pgdata = @test_dir + 'data'
+			@pgdata.mkpath
 			@pg_bin_dir = nil
 
 			@logfile = @test_dir + 'setup.log'
 			trace "Command output logged to #{@logfile}"
 
 			begin
-				unless (@test_pgdata+"postgresql.conf").exist?
-					FileUtils.rm_rf( @test_pgdata, :verbose => $DEBUG )
+				unless (@pgdata+"postgresql.conf").exist?
+					FileUtils.rm_rf( @pgdata, :verbose => $DEBUG )
 					trace "Running initdb"
-					log_and_run @logfile, pg_bin_path('initdb'), '-E', 'UTF8', '--no-locale', '-D', @test_pgdata.to_s
+					log_and_run @logfile, pg_bin_path('initdb'), '-E', 'UTF8', '--no-locale', '-D', @pgdata.to_s
 				end
 
-				unless (@test_pgdata+"ruby-pg-server-cert").exist?
+				unless (@pgdata+"ruby-pg-server-cert").exist?
 					trace "Enable SSL"
 					# Enable SSL in server config
-					File.open(@test_pgdata+"postgresql.conf", "a+") do |fd|
+					File.open(@pgdata+"postgresql.conf", "a+") do |fd|
 						fd.puts <<-EOT
 ssl = on
 ssl_ca_file = 'ruby-pg-ca-cert'
@@ -282,8 +283,8 @@ EOT
 					end
 
 					# Enable MD5 authentication in hba config
-					hba_content = File.read(@test_pgdata+"pg_hba.conf")
-					File.open(@test_pgdata+"pg_hba.conf", "w") do |fd|
+					hba_content = File.read(@pgdata+"pg_hba.conf")
+					File.open(@pgdata+"pg_hba.conf", "w") do |fd|
 						fd.puts <<-EOT
 # TYPE  DATABASE     USER              ADDRESS             METHOD
 host    all          testusermd5       ::1/128             md5
@@ -292,17 +293,17 @@ EOT
 					end
 
 					trace "Generate certificates"
-					generate_ssl_certs(@test_pgdata.to_s)
+					generate_ssl_certs(@pgdata.to_s)
 				end
 
 				trace "Starting postgres"
 				sopt = "-p #{@port}"
 				sopt += " -k #{@test_dir.to_s.dump}" unless RUBY_PLATFORM=~/mingw|mswin/i
 				log_and_run @logfile, pg_bin_path('pg_ctl'), '-w', '-o', sopt,
-					'-D', @test_pgdata.to_s, 'start'
+					'-D', @pgdata.to_s, 'start'
 				sleep 2
 
-				td = @test_pgdata
+				td = @pgdata
 				@conninfo = "host=localhost port=#{@port} dbname=test sslrootcert=#{td + 'ruby-pg-ca-cert'} sslcert=#{td + 'ruby-pg-client-cert'} sslkey=#{td + 'ruby-pg-client-key'}"
 				@unix_socket = @test_dir.to_s
 			rescue => err
@@ -350,7 +351,7 @@ EOT
 		def teardown
 			trace "Tearing down test database for #{@name}"
 
-			log_and_run @logfile, pg_bin_path('pg_ctl'), '-D', @test_pgdata.to_s, '-m', 'fast', 'stop'
+			log_and_run @logfile, pg_bin_path('pg_ctl'), '-D', @pgdata.to_s, '-m', 'fast', 'stop'
 		end
 
 		def pg_bin_path(cmd)
@@ -593,7 +594,7 @@ EOT
 		# Run examples with gated scheduler
 		sched = Helpers::TcpGateScheduler.new(external_host: 'localhost', external_port: ENV['PGPORT'].to_i, debug: ENV['PG_DEBUG']=='1')
 		Fiber.set_scheduler(sched)
-		@conninfo_gate = @conninfo.gsub(/(^| )port=\d+/, " port=#{sched.internal_port} sslmode=disable")
+		@conninfo_gate = @conninfo.gsub(/(^| )port=\d+/, " port=#{sched.internal_port}")
 
 		# Run examples with default scheduler
 		#Fiber.set_scheduler(Helpers::Scheduler.new)
@@ -639,7 +640,7 @@ EOT
 	def gate_setup
 		# Run examples with gate
 		gate = Helpers::TcpGateSwitcher.new(external_host: 'localhost', external_port: ENV['PGPORT'].to_i, debug: ENV['PG_DEBUG']=='1')
-		@conninfo_gate = @conninfo.gsub(/(^| )port=\d+/, " port=#{gate.internal_port} sslmode=disable")
+		@conninfo_gate = @conninfo.gsub(/(^| )port=\d+/, " port=#{gate.internal_port}")
 
 		# Run examples without gate
 		#@conninfo_gate = @conninfo
@@ -677,8 +678,8 @@ EOT
 	end
 
 	# Append or change 'rubypg_test' host entry in /etc/hosts to a given IP address
-	def set_etc_hosts(hostaddr)
-		system "sudo --non-interactive sed -i '/.* rubypg_test$/{h;s/.*/#{hostaddr} rubypg_test/};${x;/^$/{s//#{hostaddr} rubypg_test/;H};x}' /etc/hosts" or skip("unable to change /etc/hosts file")
+	def set_etc_hosts(hostaddr, hostname)
+		system "sudo --non-interactive sed -i '/.* #{hostname}$/{h;s/.*/#{hostaddr} #{hostname}/};${x;/^$/{s//#{hostaddr} #{hostname}/;H};x}' /etc/hosts" or skip("unable to change /etc/hosts file")
 	end
 end
 
@@ -711,7 +712,7 @@ RSpec.configure do |config|
 	config.filter_run_excluding( :ipv6 ) if Addrinfo.getaddrinfo("localhost", nil, nil, :STREAM).size < 2
 	config.filter_run_excluding( :ractor ) unless defined?(Ractor)
 	begin
-		require "bigdecimal"
+		PG.require_bigdecimal_without_warning
 	rescue LoadError
 		config.filter_run_excluding( :bigdecimal )
 	end
@@ -721,7 +722,7 @@ RSpec.configure do |config|
 		YSQL::TestingHelpers.stop_existing_postmasters
 
 		ENV['PGHOST'] = 'localhost'
-		ENV['PGPORT'] ||= "54321"
+		ENV['PGPORT'] ||= "23456"
 		port = ENV['PGPORT'].to_i
 		$pg_server = YSQL::TestingHelpers::PostgresServer.new("specs", port: port)
 		$pg_server.create_test_db
@@ -730,3 +731,12 @@ RSpec.configure do |config|
 		$pg_server.teardown
 	end
 end
+
+
+# Do not wait for threads doing blocking calls at the process shutdown.
+# Instead exit immediately after printing the rspec report, if we know there are pending IO calls, which do not react on ruby interrupts.
+END{
+	if $scheduler_timeout
+		exit!(1)
+	end
+}

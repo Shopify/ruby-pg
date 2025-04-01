@@ -119,6 +119,10 @@ pg_text_enc_boolean(t_pg_coder *this, VALUE value, char *out, VALUE *intermediat
 int
 pg_coder_enc_to_s(t_pg_coder *this, VALUE value, char *out, VALUE *intermediate, int enc_idx)
 {
+	/* Attention:
+	 * In contrast to all other encoders, the "this" pointer of this encoder can be NULL.
+	 * This is because it is used as a fall-back if no encoder is defined.
+	 */
 	VALUE str = rb_obj_as_string(value);
 	if( ENCODING_GET(str) == enc_idx ){
 		*intermediate = str;
@@ -227,7 +231,7 @@ pg_text_enc_integer(t_pg_coder *this, VALUE value, char *out, VALUE *intermediat
  *
  */
 static int
-pg_text_enc_float(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate, int enc_idx)
+pg_text_enc_float(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate1, int enc_idx)
 {
 	if(out){
 		double dvalue = NUM2DBL(value);
@@ -235,7 +239,6 @@ pg_text_enc_float(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate,
 		int neg = 0;
 		int exp2i, exp10i, i;
 		unsigned long long ll, remainder, oldval;
-		VALUE intermediate;
 
 		/* Cast to the same strings as value.to_s . */
 		if( isinf(dvalue) ){
@@ -279,6 +282,7 @@ pg_text_enc_float(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate,
 
 		if( exp10i <= -5 || exp10i >= 15 ) {
 			/* Write the float in exponent format (1.23e45) */
+			VALUE intermediate;
 
 			/* write fraction digits from right to left */
 			for( i = MAX_DOUBLE_DIGITS; i > 1; i--){
@@ -345,6 +349,8 @@ pg_text_enc_float(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate,
  *
  * It converts Integer, Float and BigDecimal objects.
  * All other objects are expected to respond to +to_s+.
+ *
+ * As soon as this class is used, it requires the 'bigdecimal' gem.
  */
 static int
 pg_text_enc_numeric(t_pg_coder *this, VALUE value, char *out, VALUE *intermediate, int enc_idx)
@@ -377,7 +383,7 @@ init_pg_text_encoder_numeric(VALUE rb_mPG_TextDecoder)
 {
 	s_str_F = rb_str_freeze(rb_str_new_cstr("F"));
 	rb_global_variable(&s_str_F);
-	rb_require("bigdecimal");
+	rb_funcall(rb_mPG, rb_intern("require_bigdecimal_without_warning"), 0);
 	s_cBigDecimal = rb_const_get(rb_cObject, rb_intern("BigDecimal"));
 
 	/* dummy = rb_define_class_under( rb_mPG_TextEncoder, "Numeric", rb_cPG_SimpleEncoder ); */
@@ -437,7 +443,7 @@ quote_array_buffer( void *_this, char *p_in, int strlen, char *p_out ){
 	t_pg_composite_coder *this = _this;
 	char *ptr1;
 	char *ptr2;
-	int backslashs = 0;
+	int backslashes = 0;
 	int needquote;
 
 	/* count data plus backslashes; detect chars needing quotes */
@@ -454,7 +460,7 @@ quote_array_buffer( void *_this, char *p_in, int strlen, char *p_out ){
 
 		if (ch == '"' || ch == '\\'){
 			needquote = 1;
-			backslashs++;
+			backslashes++;
 		} else if (ch == '{' || ch == '}' || ch == this->delimiter ||
 					ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\v' || ch == '\f'){
 			needquote = 1;
@@ -463,12 +469,12 @@ quote_array_buffer( void *_this, char *p_in, int strlen, char *p_out ){
 
 	if( needquote ){
 		ptr1 = p_in + strlen;
-		ptr2 = p_out + strlen + backslashs + 2;
+		ptr2 = p_out + strlen + backslashes + 2;
 		/* Write end quote */
 		*--ptr2 = '"';
 
 		/* Then store the escaped string on the final position, walking
-			* right to left, until all backslashs are placed. */
+			* right to left, until all backslashes are placed. */
 		while( ptr1 != p_in ) {
 			*--ptr2 = *--ptr1;
 			if(*ptr2 == '"' || *ptr2 == '\\'){
@@ -477,7 +483,7 @@ quote_array_buffer( void *_this, char *p_in, int strlen, char *p_out ){
 		}
 		/* Write start quote */
 		*p_out = '"';
-		return strlen + backslashs + 2;
+		return strlen + backslashes + 2;
 	} else {
 		if( p_in != p_out )
 			memcpy( p_out, p_in, strlen );
@@ -531,13 +537,17 @@ quote_string(t_pg_coder *this, VALUE value, VALUE string, char *current_out, int
 }
 
 static char *
-write_array(t_pg_composite_coder *this, VALUE value, char *current_out, VALUE string, int quote, int enc_idx)
+write_array(t_pg_composite_coder *this, VALUE value, char *current_out, VALUE string, int quote, int enc_idx, int dimension)
 {
 	int i;
 
 	/* size of "{}" */
 	current_out = pg_rb_str_ensure_capa( string, 2, current_out, NULL );
 	*current_out++ = '{';
+
+	if( RARRAY_LEN(value) == 0 && this->dimensions >= 0 && dimension != this->dimensions ){
+		rb_raise(rb_eArgError, "less array dimensions to encode (%d) than expected (%d)", dimension, this->dimensions);
+	}
 
 	for( i=0; i<RARRAY_LEN(value); i++){
 		VALUE entry = rb_ary_entry(value, i);
@@ -548,17 +558,26 @@ write_array(t_pg_composite_coder *this, VALUE value, char *current_out, VALUE st
 		}
 
 		switch(TYPE(entry)){
-			case T_ARRAY:
-				current_out = write_array(this, entry, current_out, string, quote, enc_idx);
-			break;
 			case T_NIL:
+				if( this->dimensions >= 0 && dimension != this->dimensions ){
+					rb_raise(rb_eArgError, "less array dimensions to encode (%d) than expected (%d)", dimension, this->dimensions);
+				}
 				current_out = pg_rb_str_ensure_capa( string, 4, current_out, NULL );
 				*current_out++ = 'N';
 				*current_out++ = 'U';
 				*current_out++ = 'L';
 				*current_out++ = 'L';
 				break;
+			case T_ARRAY:
+				if( this->dimensions < 0 || dimension < this->dimensions ){
+					current_out = write_array(this, entry, current_out, string, quote, enc_idx, dimension+1);
+					break;
+				}
+				/* Number of dimensions reached -> handle array as normal value */
 			default:
+				if( this->dimensions >= 0 && dimension != this->dimensions ){
+					rb_raise(rb_eArgError, "less array dimensions to encode (%d) than expected (%d)", dimension, this->dimensions);
+				}
 				current_out = quote_string( this->elem, entry, string, current_out, quote, quote_array_buffer, this, enc_idx );
 		}
 	}
@@ -590,7 +609,7 @@ pg_text_enc_array(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate,
 		VALUE out_str = rb_str_new(NULL, 0);
 		PG_ENCODING_SET_NOCHECK(out_str, enc_idx);
 
-		end_ptr = write_array(this, value, RSTRING_PTR(out_str), out_str, this->needs_quotation, enc_idx);
+		end_ptr = write_array(this, value, RSTRING_PTR(out_str), out_str, this->needs_quotation, enc_idx, 1);
 
 		rb_str_set_len( out_str, end_ptr - RSTRING_PTR(out_str) );
 		*intermediate = out_str;
@@ -692,22 +711,22 @@ static int
 quote_literal_buffer( void *_this, char *p_in, int strlen, char *p_out ){
 	char *ptr1;
 	char *ptr2;
-	int backslashs = 0;
+	int backslashes = 0;
 
 	/* count required backlashs */
 	for(ptr1 = p_in; ptr1 != p_in + strlen; ptr1++) {
 		if (*ptr1 == '\''){
-			backslashs++;
+			backslashes++;
 		}
 	}
 
 	ptr1 = p_in + strlen;
-	ptr2 = p_out + strlen + backslashs + 2;
+	ptr2 = p_out + strlen + backslashes + 2;
 	/* Write end quote */
 	*--ptr2 = '\'';
 
 	/* Then store the escaped string on the final position, walking
-		* right to left, until all backslashs are placed. */
+		* right to left, until all backslashes are placed. */
 	while( ptr1 != p_in ) {
 		*--ptr2 = *--ptr1;
 		if(*ptr2 == '\''){
@@ -716,7 +735,7 @@ quote_literal_buffer( void *_this, char *p_in, int strlen, char *p_out ){
 	}
 	/* Write start quote */
 	*p_out = '\'';
-	return strlen + backslashs + 2;
+	return strlen + backslashes + 2;
 }
 
 

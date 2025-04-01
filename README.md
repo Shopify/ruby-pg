@@ -110,7 +110,7 @@ Rest of the README is from upstream repository.
 ## Description
 
 Pg is the Ruby interface to the [PostgreSQL RDBMS](http://www.postgresql.org/).
-It works with [PostgreSQL 9.3 and later](http://www.postgresql.org/support/versioning/).
+It works with [PostgreSQL 10 and later](http://www.postgresql.org/support/versioning/).
 
 A small example usage:
 
@@ -139,8 +139,8 @@ end
 
 ## Requirements
 
-* Ruby 2.5 or newer
-* PostgreSQL 9.3.x or later (with headers, -dev packages, etc).
+* Ruby 2.7 or newer
+* PostgreSQL 10.x or later (with headers, -dev packages, etc).
 
 It usually works with earlier versions of Ruby/PostgreSQL as well, but those are
 not regularly tested.
@@ -242,7 +242,7 @@ The following PostgreSQL column types are supported by ruby-pg (TE = Text Encode
 * Date: [TE](rdoc-ref:PG::TextEncoder::Date), [TD](rdoc-ref:PG::TextDecoder::Date), [BE](rdoc-ref:PG::BinaryEncoder::Date), [BD](rdoc-ref:PG::BinaryDecoder::Date)
 * JSON and JSONB: [TE](rdoc-ref:PG::TextEncoder::JSON), [TD](rdoc-ref:PG::TextDecoder::JSON)
 * Inet: [TE](rdoc-ref:PG::TextEncoder::Inet), [TD](rdoc-ref:PG::TextDecoder::Inet)
-* Array: [TE](rdoc-ref:PG::TextEncoder::Array), [TD](rdoc-ref:PG::TextDecoder::Array)
+* Array: [TE](rdoc-ref:PG::TextEncoder::Array), [TD](rdoc-ref:PG::TextDecoder::Array), [BE](rdoc-ref:PG::BinaryEncoder::Array), [BD](rdoc-ref:PG::BinaryDecoder::Array)
 * Composite Type (also called "Row" or "Record"): [TE](rdoc-ref:PG::TextEncoder::Record), [TD](rdoc-ref:PG::TextDecoder::Record)
 
 The following text and binary formats can also be encoded although they are not used as column type:

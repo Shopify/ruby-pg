@@ -62,7 +62,7 @@ context "with a Fiber scheduler", :scheduler do
 		end
 	end
 
-	it "connects using without host but envirinment variables", :postgresql_12, :unix_socket do
+	it "connects with environment variables", :postgresql_12, :unix_socket do
 		run_with_scheduler do
 			vars = YSQL::Connection.conninfo_parse(@conninfo_gate).each_with_object({}){|h, o| o[h[:keyword].to_sym] = h[:val] if h[:val] }
 
@@ -246,7 +246,7 @@ context "with a Fiber scheduler", :scheduler do
 		end
 	end
 
-	it "can encrypt_password", :postgresql_10 do
+	it "can encrypt_password" do
 		run_with_scheduler do |conn|
 			res = conn.encrypt_password "passw", "myuser"
 			expect( res ).to  match( /\S+/ )
@@ -263,12 +263,20 @@ context "with a Fiber scheduler", :scheduler do
 			expect( ping ).to eq(YSQL::PQPING_OK )
 		end
 	end
-end
 
-# Do not wait for threads doing blocking calls at the process shutdown.
-# Instead exit immediately after printing the rspec report, if we know there are pending IO calls, which do not react on ruby interrupts.
-END{
-	if $scheduler_timeout
-		exit!(1)
+	it "can send a pipeline_sync message", :postgresql_14 do
+		run_with_scheduler(99) do |conn|
+			conn.enter_pipeline_mode
+			1000.times do |idx|
+				# This doesn't fail on sync_pipeline_sync, since PQpipelineSync() tries to flush, but doesn't wait for writablility.
+				conn.pipeline_sync
+			end
+			1000.times do
+				expect( conn.get_result.result_status ).to eq( PG::PGRES_PIPELINE_SYNC )
+			end
+			expect( conn.get_result ).to be_nil
+			expect( conn.get_result ).to be_nil
+			conn.exit_pipeline_mode
+		end
 	end
-}
+end

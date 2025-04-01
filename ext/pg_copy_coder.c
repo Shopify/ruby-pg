@@ -51,7 +51,7 @@ static const rb_data_type_t pg_copycoder_type = {
 		pg_copycoder_mark,
 		RUBY_TYPED_DEFAULT_FREE,
 		pg_copycoder_memsize,
-		pg_compact_callback(pg_copycoder_compact),
+		pg_copycoder_compact,
 	},
 	&pg_coder_type,
 	0,
@@ -212,6 +212,7 @@ pg_copycoder_type_map_get(VALUE self)
  *
  * See also PG::TextDecoder::CopyRow for the decoding direction with
  * PG::Connection#get_copy_data .
+ * And see PG::BinaryEncoder::CopyRow for an encoder of the COPY binary format.
  */
 static int
 pg_text_enc_copy_row(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate, int enc_idx)
@@ -235,7 +236,7 @@ pg_text_enc_copy_row(t_pg_coder *conv, VALUE value, char *out, VALUE *intermedia
 		char *ptr1;
 		char *ptr2;
 		int strlen;
-		int backslashs;
+		int backslashes;
 		VALUE subint;
 		VALUE entry;
 
@@ -286,19 +287,19 @@ pg_text_enc_copy_row(t_pg_coder *conv, VALUE value, char *out, VALUE *intermedia
 					ptr2 = current_out + strlen;
 
 					/* count required backlashs */
-					for(backslashs = 0; ptr1 != ptr2; ptr1++) {
+					for(backslashes = 0; ptr1 != ptr2; ptr1++) {
 						/* Escape backslash itself, newline, carriage return, and the current delimiter character. */
 						if(*ptr1 == '\\' || *ptr1 == '\n' || *ptr1 == '\r' || *ptr1 == this->delimiter){
-							backslashs++;
+							backslashes++;
 						}
 					}
 
 					ptr1 = current_out + strlen;
-					ptr2 = current_out + strlen + backslashs;
+					ptr2 = current_out + strlen + backslashes;
 					current_out = ptr2;
 
 					/* Then store the escaped string on the final position, walking
-					 * right to left, until all backslashs are placed. */
+					 * right to left, until all backslashes are placed. */
 					while( ptr1 != ptr2 ) {
 						*--ptr2 = *--ptr1;
 						if(*ptr1 == '\\' || *ptr1 == '\n' || *ptr1 == '\r' || *ptr1 == this->delimiter){
@@ -358,6 +359,7 @@ pg_text_enc_copy_row(t_pg_coder *conv, VALUE value, char *out, VALUE *intermedia
  *
  * See also PG::BinaryDecoder::CopyRow for the decoding direction with
  * PG::Connection#get_copy_data .
+ * And see PG::TextEncoder::CopyRow for an encoder of the COPY text format.
  */
 static int
 pg_bin_enc_copy_row(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate, int enc_idx)
@@ -391,7 +393,7 @@ pg_bin_enc_copy_row(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediat
 
 		switch(TYPE(entry)){
 			case T_NIL:
-				/* 4 bytes for -1 indicationg a NULL value */
+				/* 4 bytes for -1 indicating a NULL value */
 				PG_RB_STR_ENSURE_CAPA( *intermediate, 4, current_out, end_capa_ptr );
 				write_nbo32(-1, current_out);
 				current_out += 4;
@@ -496,6 +498,7 @@ GetDecimalFromHex(char hex)
  *
  * See also PG::TextEncoder::CopyRow for the encoding direction with
  * PG::Connection#put_copy_data .
+ * And see PG::BinaryDecoder::CopyRow for a decoder of the COPY binary format.
  */
 /*
  * Parse the current line into separate attributes (fields),
@@ -763,6 +766,7 @@ static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
  *
  * See also PG::BinaryEncoder::CopyRow for the encoding direction with
  * PG::Connection#put_copy_data .
+ * And see PG::TextDecoder::CopyRow for a decoder of the COPY text format.
  */
 static VALUE
 pg_bin_dec_copy_row(t_pg_coder *conv, const char *input_line, int len, int _tuple, int _field, int enc_idx)
@@ -827,7 +831,6 @@ pg_bin_dec_copy_row(t_pg_coder *conv, const char *input_line, int len, int _tupl
 
 		for( fieldno = 0; fieldno < nfields; fieldno++){
 			long input_len;
-			VALUE field_value;
 
 			/* read field size */
 			if (line_end_ptr - cur_ptr < 4 ) goto length_error;
@@ -839,6 +842,7 @@ pg_bin_dec_copy_row(t_pg_coder *conv, const char *input_line, int len, int _tupl
 				/* NULL indicator */
 				rb_ary_push(array, Qnil);
 			} else {
+				VALUE field_value;
 				if (line_end_ptr - cur_ptr < input_len ) goto length_error;
 
 				/* copy input data to field_str */

@@ -93,31 +93,31 @@ describe 'Basic type mapping' do
 				@conn.type_map_for_results = YSQL::TypeMapAllStrings.new.freeze
 			end
 
-			it "should do boolean type conversions" do
-				[1, 0].each do |format|
+			[1, 0].each do |format|
+				it "should do format #{format} boolean type conversions" do
 					res = @conn.exec_params( "SELECT true::BOOLEAN, false::BOOLEAN, NULL::BOOLEAN", [], format )
 					expect( res.values ).to eq( [[true, false, nil]] )
 				end
 			end
 
-			it "should do binary type conversions" do
-				[1, 0].each do |format|
+			[1, 0].each do |format|
+				it "should do format #{format} binary type conversions" do
 					res = @conn.exec_params( "SELECT E'\\\\000\\\\377'::BYTEA", [], format )
 					expect( res.values ).to eq( [[["00ff"].pack("H*")]] )
 					expect( res.values[0][0].encoding ).to eq( Encoding::ASCII_8BIT )
 				end
 			end
 
-			it "should do integer type conversions" do
-				[1, 0].each do |format|
+			[1, 0].each do |format|
+				it "should do format #{format} integer type conversions" do
 					res = @conn.exec_params( "SELECT -8999::INT2, -899999999::INT4, -8999999999999999999::INT8", [], format )
 					expect( res.values ).to eq( [[-8999, -899999999, -8999999999999999999]] )
 				end
 			end
 
-			it "should do string type conversions" do
-				@conn.internal_encoding = 'utf-8'
-				[1, 0].each do |format|
+			[1, 0].each do |format|
+				it "should do format #{format} string type conversions" do
+					@conn.internal_encoding = 'utf-8'
 					res = @conn.exec_params( "SELECT 'abcäöü'::TEXT, 'colname'::name", [], format )
 					expect( res.values ).to eq( [['abcäöü', 'colname']] )
 					expect( [res.ftype(0), res.ftype(1)] ).to eq( [25, 19] )
@@ -125,8 +125,8 @@ describe 'Basic type mapping' do
 				end
 			end
 
-			it "should do float type conversions" do
-				[1, 0].each do |format|
+			[1, 0].each do |format|
+				it "should do format #{format} float type conversions" do
 					res = @conn.exec_params( "SELECT -8.999e3::FLOAT4,
 														8.999e10::FLOAT4,
 														-8999999999e-99::FLOAT8,
@@ -253,8 +253,8 @@ describe 'Basic type mapping' do
 				end
 			end
 
-			it "should do numeric type conversions", :bigdecimal do
-				[0].each do |format|
+			[0].each do |format|
+				it "should do format #{format} numeric type conversions", :bigdecimal do
 					small = '123456790123.12'
 					large = ('123456790'*10) << '.' << ('012345679')
 					numerics = [
@@ -274,8 +274,8 @@ describe 'Basic type mapping' do
 				end
 			end
 
-			it "should do JSON conversions", :postgresql_94 do
-				[0].each do |format|
+			[0].each do |format|
+				it "should do format #{format} JSON conversions" do
 					['JSON', 'JSONB'].each do |type|
 						res = @conn.exec_params( "SELECT CAST('123' AS #{type}),
 																			CAST('12.3' AS #{type}),
@@ -295,8 +295,8 @@ describe 'Basic type mapping' do
 				end
 			end
 
-			it "should do array type conversions" do
-				[0].each do |format|
+			[0, 1].each do |format|
+				it "should do format #{format} array type conversions" do
 					res = @conn.exec_params( "SELECT CAST('{1,2,3}' AS INT2[]), CAST('{{1,2},{3,4}}' AS INT2[][]),
 															CAST('{1,2,3}' AS INT4[]),
 															CAST('{1,2,3}' AS INT8[]),
@@ -316,8 +316,18 @@ describe 'Basic type mapping' do
 				end
 			end
 
-			it "should do inet type conversions" do
-				[0].each do |format|
+			[0].each do |format|
+				it "should do format #{format} anonymous record type conversions" do
+					res = @conn.exec_params( "SELECT 6, ROW(123, 'str', true, null), 7
+						", [], format )
+					expect( res.getvalue(0,0) ).to eq( 6 )
+					expect( res.getvalue(0,1) ).to eq( ["123", "str", "t", nil] )
+					expect( res.getvalue(0,2) ).to eq( 7 )
+				end
+			end
+
+			[0].each do |format|
+				it "should do format #{format} inet type conversions" do
 					vals = [
 						'1.2.3.4',
 						'0.0.0.0/0',
@@ -346,8 +356,8 @@ describe 'Basic type mapping' do
 				end
 			end
 
-			it "should do cidr type conversions" do
-				[0].each do |format|
+			[0].each do |format|
+				it "should do format #{format} cidr type conversions" do
 					vals = [
 						'0.0.0.0/0',
 						'1.0.0.0/8',
@@ -387,20 +397,30 @@ describe 'Basic type mapping' do
 		end
 
 		context "with usage of result oids for copy decoder selection" do
-			it "can type cast #copy_data text output with decoder" do
-				@conn.exec( "CREATE TEMP TABLE copytable (t TEXT, i INT, ai INT[])" )
-				@conn.exec( "INSERT INTO copytable VALUES ('a', 123, '{5,4,3}'), ('b', 234, '{2,3}')" )
+			[0, 1].each do |format|
+				it "can type cast #copy_data output in format #{format} with decoder" do
+					@conn.exec( "CREATE TEMP TABLE copytable (t TEXT, i INT, ai INT[], b BYTEA, ts timestamp)" )
+					@conn.exec( "INSERT INTO copytable VALUES ('a', 1234, '{{5,4},{3,2}}', '\\xff000a0d27', '2023-03-17 03:04:05.678912'), ('b', -444, '{2,3}', '\\x202078797a2020', '1990-12-17 15:14:45')" )
 
 				# Retrieve table OIDs per empty result.
 				res = @conn.exec( "SELECT * FROM copytable LIMIT 0" )
 				tm = basic_type_mapping.build_column_map( res )
 				row_decoder = YSQL::TextDecoder::CopyRow.new(type_map: tm).freeze
 
-				rows = []
-				@conn.copy_data( "COPY copytable TO STDOUT", row_decoder ) do |res|
-					while row=@conn.get_copy_data
-						rows << row
+					rows = []
+					@conn.copy_data( "COPY copytable TO STDOUT WITH (FORMAT #{ format==1 ? "binary" : "text" })", row_decoder ) do |res|
+						while row=@conn.get_copy_data
+							rows << row
+						end
 					end
+
+					expect( rows.map{|l| l[0,4] } ).to eq( [['a', 1234, [[5,4],[3,2]], "\xff\x00\n\r'".b], ['b', -444, [2,3], "  xyz  "]] )
+					# For compatibility reason the timestamp in text format is encoded as local time (TimestampWithoutTimeZone) instead of UTC
+					tmeth = format == 1 ? :utc : :local
+					expect( rows[0][4] ).
+						to be_within(0.000001).of( Time.send(tmeth, 2023, 3, 17, 3, 4, 5.678912) )
+					expect( rows[1][4] ).
+						to be_within(0.000001).of( Time.send(tmeth, 1990, 12, 17, 15, 14, 45) )
 				end
 				expect( rows ).to eq( [['a', 123, [5,4,3]], ['b', 234, [2,3]]] )
 			end

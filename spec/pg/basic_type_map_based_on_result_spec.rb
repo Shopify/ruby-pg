@@ -40,33 +40,36 @@ describe 'Basic type mapping' do
 				tm = basic_type_mapping.build_column_map( res )
 				row_encoder = YSQL::TextEncoder::CopyRow.new type_map: tm
 
-				conn.copy_data( "COPY copytable FROM STDIN", row_encoder ) do |res|
-					conn.put_copy_data ['b', 234, [2,3]]
-				end
-				res = conn.exec( "SELECT * FROM copytable" )
-				res.values
-			ensure
-				conn&.finish
-			end.take
+					conn.copy_data( "COPY copytable FROM STDIN WITH (FORMAT #{ format==1 ? "binary" : "text" })", row_encoder ) do |res|
+						conn.put_copy_data ['b', 234, [2,3]]
+					end
+					res = conn.exec( "SELECT * FROM copytable" )
+					res.values
+				ensure
+					conn&.finish
+				end.take
 
-			expect( vals ).to eq( [['b', '234', '{2,3}']] )
+				expect( vals ).to eq( [['b', '234', '{2,3}']] )
+			end
 		end
 
 		context "with usage of result oids for bind params encoder selection" do
-			it "can type cast query params" do
-				@conn.exec( "CREATE TEMP TABLE copytable (t TEXT, i INT, ai INT[], by BYTEA)" )
+			[1, 0].each do |format|
+				it "can type cast query params to format #{format}" do
+					@conn.exec( "CREATE TEMP TABLE copytable (t TEXT, i INT, ai INT[], by BYTEA)" )
 
-				# Retrieve table OIDs per empty result.
-				res = @conn.exec( "SELECT * FROM copytable LIMIT 0" )
-				tm = basic_type_mapping.build_column_map( res )
+					# Retrieve table OIDs per empty result.
+					res = @conn.exec( "SELECT * FROM copytable LIMIT 0", [], format )
+					tm = basic_type_mapping.build_column_map( res )
 
-				@conn.exec_params( "INSERT INTO copytable VALUES ($1, $2, $3, $4)", ['a', 123, [5,4,3], "\0\xFF'"], 0, tm )
-				@conn.exec_params( "INSERT INTO copytable VALUES ($1, $2, $3, $4)", ['b', 234, [2,3], "\"\n\r"], 0, tm )
-				res = @conn.exec( "SELECT * FROM copytable" )
-				expect( res.values ).to eq( [['a', '123', '{5,4,3}', '\x00ff27'], ['b', '234', '{2,3}', '\x220a0d']] )
+					@conn.exec_params( "INSERT INTO copytable VALUES ($1, $2, $3, $4)", ['a', 123, [5,4,3], "\0\xFF'"], 0, tm )
+					@conn.exec_params( "INSERT INTO copytable VALUES ($1, $2, $3, $4)", ['b', 234, [2,3], "\"\n\r"], 0, tm )
+					res = @conn.exec( "SELECT * FROM copytable" )
+					expect( res.values ).to eq( [['a', '123', '{5,4,3}', '\x00ff27'], ['b', '234', '{2,3}', '\x220a0d']] )
+				end
 			end
 
-			it "can do JSON conversions", :postgresql_94 do
+			it "can do JSON conversions" do
 				['JSON', 'JSONB'].each do |type|
 					sql = "SELECT CAST('123' AS #{type}),
 						CAST('12.3' AS #{type}),
@@ -101,20 +104,22 @@ describe 'Basic type mapping' do
 		end
 
 		context "with usage of result oids for copy encoder selection" do
-			it "can type cast #copy_data text input with encoder" do
-				@conn.exec( "CREATE TEMP TABLE copytable (t TEXT, i INT, ai INT[])" )
+			[1, 0].each do |format|
+				it "can type cast #copy_data text input with encoder to format #{format}" do
+					@conn.exec( "CREATE TEMP TABLE copytable (t TEXT, i INT, ai INT[])" )
 
 				# Retrieve table OIDs per empty result set.
 				res = @conn.exec( "SELECT * FROM copytable LIMIT 0" )
 				tm = basic_type_mapping.build_column_map( res )
 				row_encoder = YSQL::TextEncoder::CopyRow.new type_map: tm
 
-				@conn.copy_data( "COPY copytable FROM STDIN", row_encoder ) do |res|
-					@conn.put_copy_data ['a', 123, [5,4,3]]
-					@conn.put_copy_data ['b', 234, [2,3]]
+					@conn.copy_data( "COPY copytable FROM STDIN WITH (FORMAT #{ format==1 ? "binary" : "text" })", row_encoder ) do |res|
+						@conn.put_copy_data ['a', 123, [[5,4],[3,2]]]
+						@conn.put_copy_data ['b', 234, [2,3]]
+					end
+					res = @conn.exec( "SELECT * FROM copytable" )
+					expect( res.values ).to eq( [['a', '123', '{{5,4},{3,2}}'], ['b', '234', '{2,3}']] )
 				end
-				res = @conn.exec( "SELECT * FROM copytable" )
-				expect( res.values ).to eq( [['a', '123', '{5,4,3}'], ['b', '234', '{2,3}']] )
 			end
 
 			[1, 0].each do |format|

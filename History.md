@@ -1,3 +1,60 @@
+## v1.6.0.rc1 [2024-11-28] Lars Kanis <lars@greiz-reinsdorf.de>
+
+Added:
+
+- Add fat binary gem for platform `x86_64-linux`.
+  [#551](https://github.com/ged/ruby-pg/pull/551#issuecomment-2504715762)
+- Add PG::BinaryDecoder::Array and PG::BinaryEncoder::Array to parse and encode PostgreSQL arrays in binary format.
+  [#603](https://github.com/ged/ruby-pg/pull/603)
+- Add support for new query cancel functions of PostgreSQL-17.
+  This adds the new class `PG::CancelConnection` which provides the ability to cancel a query per blocking or per non-blocking functions.
+  If the new functions are available they are used and the older are no longer compiled in.
+  This way we can get rid of reading out the internal `PGcancel` struct by `Connection#backend_key`.
+  [#614](https://github.com/ged/ruby-pg/pull/614)
+- Add Connection#set_chunked_rows_mode [#610](https://github.com/ged/ruby-pg/pull/610)
+- Add PG::Connection#close_prepared, PG::Connection#close_portal, PG::Connection#send_close_prepared and PG::Connection#send_close_portal which are new in PostgreSQL-17.
+  [#611](https://github.com/ged/ruby-pg/pull/611)
+- Add Connection#send_pipeline_sync, async_pipeline_sync and release GVL at PQ(sendP|P)ipelineSync.
+  [#612](https://github.com/ged/ruby-pg/pull/612)
+
+Removed:
+
+- Drop support of Ruby < 2.7 [#606](https://github.com/ged/ruby-pg/pull/606)
+- Drop support of PostgreSQL < 10 [#606](https://github.com/ged/ruby-pg/pull/606)
+- Remove workaround for Truffleruby < 21.3.0 [#613](https://github.com/ged/ruby-pg/pull/613)
+
+
+## v1.5.9 [2024-10-24] Lars Kanis <lars@greiz-reinsdorf.de>
+
+- Enable thread safety in static OpenSSL build for Windows. [#595](https://github.com/ged/ruby-pg/pull/595)
+- Remove raising `conect_timeout` from 1 to 2 seconds. [#590](https://github.com/ged/ruby-pg/pull/590)
+- Fix binary copy_data in Ractor context. [#594](https://github.com/ged/ruby-pg/pull/594)
+- Exclude CI files and hidden files from built gem. [#591](https://github.com/ged/ruby-pg/pull/591)
+  This is to simplify security inspection.
+- Update error classes to PostgreSQL-17.
+- Update Windows fat binary gem to OpenSSL-3.4.0 and PostgreSQL-17.0.
+
+
+## v1.5.8 [2024-09-06] Lars Kanis <lars@greiz-reinsdorf.de>
+
+- Fix host list duplication every time conn.reset is used. [#586](https://github.com/ged/ruby-pg/pull/586)
+- Add default decoder for anonymous record types to BasicTypeRegistry [#579](https://github.com/ged/ruby-pg/pull/579)
+- Update Windows fat binary gem to OpenSSL-3.3.2 and PostgreSQL-16.4.
+
+
+## v1.5.7 [2024-07-28] Lars Kanis <lars@greiz-reinsdorf.de>
+
+- Remove deprecated use of fptr->fd.[#562](https://github.com/ged/ruby-pg/pull/562)
+  Direct access is disallowed since ruby-3.4.
+- Make `pgconn_connect_poll` close the socket prior to calling `PQconnectPoll`. [#564](https://github.com/ged/ruby-pg/pull/564)
+  This could result in an exception while connecting when used multi threaded.
+- Fix several typos and improve spelling in documentation and code. [#566](https://github.com/ged/ruby-pg/pull/566)
+- Add missing PG::RollbackTransaction as an option to exit conn.transaction. [#560](https://github.com/ged/ruby-pg/pull/560)
+  Usage like in rails: https://api.rubyonrails.org/classes/ActiveRecord/Rollback.html
+- Don't print a warning when bigdecimal is required on ruby-3.4+ [#574](https://github.com/ged/ruby-pg/pull/574)
+- Update Windows fat binary gem to OpenSSL-3.3.1 and PostgreSQL-16.3.
+
+
 ## v1.5.6 [2024-03-01] Lars Kanis <lars@greiz-reinsdorf.de>
 
 - Renew address resolution (DNS) in conn.reset. [#558](https://github.com/ged/ruby-pg/pull/558)
@@ -92,7 +149,7 @@ Removed:
 Repository:
 
 - `rake test` tries to find PostgreSQL server commands by pg_config [#503](https://github.com/ged/ruby-pg/pull/503)
-  So there's no need to set the PATH manuelly any longer.
+  So there's no need to set the PATH manually any longer.
 
 
 ## v1.4.6 [2023-02-26] Lars Kanis <lars@greiz-reinsdorf.de>
@@ -161,7 +218,7 @@ Added:
 Bugfixes:
 
 - Try IPv6 and IPv4 addresses, if DNS resolves to both. [#452](https://github.com/ged/ruby-pg/pull/452)
-- Re-add block-call semantics to PG::Connection.new accidently removed in pg-1.3.0. [#454](https://github.com/ged/ruby-pg/pull/454)
+- Re-add block-call semantics to PG::Connection.new accidentally removed in pg-1.3.0. [#454](https://github.com/ged/ruby-pg/pull/454)
 - Handle client error after all data consumed in #copy_data for output. [#455](https://github.com/ged/ruby-pg/pull/455)
 - Avoid spurious keyword argument warning on Ruby 2.7. [#456](https://github.com/ged/ruby-pg/pull/456)
 - Change connection setup to respect connect_timeout parameter. [#459](https://github.com/ged/ruby-pg/pull/459)
@@ -200,7 +257,7 @@ Bugfixes:
 
 - Don't leak IO in case of connection errors. [#439](https://github.com/ged/ruby-pg/pull/439)
   Previously it was kept open until the PG::Connection was garbage collected.
-- Fix a performance regession in conn.get_result noticed in single row mode. [#442](https://github.com/ged/ruby-pg/pull/442)
+- Fix a performance regression in conn.get_result noticed in single row mode. [#442](https://github.com/ged/ruby-pg/pull/442)
 - Fix occasional error Errno::EBADF (Bad file descriptor) while connecting. [#444](https://github.com/ged/ruby-pg/pull/444)
 - Fix compatibility of res.stream_each* methods with Fiber.scheduler. [#446](https://github.com/ged/ruby-pg/pull/446)
 - Remove FL_TEST and FL_SET, which are MRI-internal. [#437](https://github.com/ged/ruby-pg/pull/437)
@@ -286,7 +343,7 @@ Type cast enhancements:
 - Add PG::BasicTypeMapForQueries::BinaryData for encoding of bytea columns. [#348](https://github.com/ged/ruby-pg/pull/348)
 - Reduce time to build coder maps and permit to reuse them for several type maps per PG::BasicTypeRegistry::CoderMapsBundle.new(conn) . [#376](https://github.com/ged/ruby-pg/pull/376)
 - Make BasicTypeRegistry a class and use a global default instance of it.
-  Now a local type registry can be instanciated and given to the type map, to avoid changing shared global states.
+  Now a local type registry can be instantiated and given to the type map, to avoid changing shared global states.
 - Allow PG::BasicTypeMapForQueries to take a Proc as callback for undefined types.
 
 Other Enhancements:

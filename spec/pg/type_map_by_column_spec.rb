@@ -132,7 +132,7 @@ describe YSQL::TypeMapByColumn do
 		hash_param_nil = { value: nil, type: 17, format: 1 }
 		res = @conn.exec_params( "SELECT $1::text, $2::text",
 					[ hash_param_bin, hash_param_nil ], 0, col_map )
-		expect( res.values ).to eq( [["{:value=>\"\\x00\\xFF\", :type=>17, :format=>1}", "{:value=>nil, :type=>17, :format=>1}"]] )
+		expect( res.values ).to eq( [[{value:"\x00\xFF".b, type:17, format:1}.inspect, {value:nil, type:17, format:1}.inspect]] )
 	end
 
 	it "shouldn't allow param mappings with different number of fields" do
@@ -180,6 +180,12 @@ describe YSQL::TypeMapByColumn do
 	it "should raise an error for invalid params" do
 		expect{ YSQL::TypeMapByColumn.new(:WrongType ) }.to raise_error(TypeError, /wrong argument type/)
 		expect{ YSQL::TypeMapByColumn.new([123] ) }.to raise_error(TypeError, /wrong argument type (Integer|Fixnum)/)
+	end
+
+	it "should raise an error for invalid input when used as type_map" do
+		map = PG::TypeMapByColumn.new([PG::TextEncoder::Integer.new])
+		record_encoder = PG::TextEncoder::Record.new(type_map: map)
+		expect{ record_encoder.encode(123) }.to raise_error(TypeError)
 	end
 
 	it "shouldn't allow result mappings with different number of fields" do

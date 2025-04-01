@@ -2,19 +2,19 @@
 
 # This is a special scheduler for testing compatibility to Fiber.scheduler of functions using a TCP connection.
 #
-# It works as a gate between the client and the server.
+# It works as a gatekeeper between the client and the server.
 # Data is transferred only, when the scheduler receives wait_io requests.
-# The TCP communication in a C extension can be verified in a (mostly) timing insensitive way.
-# If a call does IO but doesn't call the scheduler, the test will block and can be caught by an external timeout.
+# The TCP communication in a C extension can be verified in a timing insensitive way.
+# If a call waits for IO but doesn't call the scheduler, the test will block and can be caught by an external timeout.
 #
-#   PG.connect
-#    port:5444                    TcpGateScheduler                     DB
+#   PG.connect       intern                              extern
+#    port:5444        side        TcpGateScheduler        side         DB
 #  -------------      ----------------------------------------      --------
 #  | scheduler |      | TCPServer                  TCPSocket |      |      |
 #  |   specs   |----->|  port 5444                  port 5432|----->|Server|
 #  -------------  ^   |                                      |      | port |
-#                 '-------  wait_readable:  <-send data--    |      | 5432 |
-#           observe fd|     wait_writable:  --send data->    |      --------
+#                 '-------  wait_readable:  <--read data--   |      | 5432 |
+#           observe fd|     wait_writable:  --write data->   |      --------
 #                     ----------------------------------------
 
 module Helpers
@@ -116,7 +116,7 @@ class TcpGateScheduler < Scheduler
 		# Option `transfer_until` can be (higher to lower priority):
 		#   :eof => transfer until channel is closed
 		#   :wouldblock => transfer until no immediate data is available
-		#   IO object => transfer until IO is writeable
+		#   IO object => transfer until IO is writable
 		#
 		# The method does nothing if a transfer is already pending, but might raise the transfer_until option, if the requested priority is higher than the pending transfer.
 		def write( transfer_until: )
@@ -148,14 +148,13 @@ class TcpGateScheduler < Scheduler
 						rescue IO::WaitReadable, Errno::EINTR
 							@internal_io.wait_readable
 							retry
-						rescue EOFError, Errno::ECONNRESET
+						rescue EOFError, Errno::ECONNRESET, Errno::ECONNABORTED
 							puts "write_eof from #{write_fds}"
 							@external_io.close_write
 							break
 						end
-						break if @transfer_until != :eof && (!read_str || read_str.bytesize < len)
+						break if @transfer_until != :eof && (!read_str || read_str.empty?)
 					end
-					@until_writeable = false
 					@pending_write = false
 				end
 
@@ -282,7 +281,7 @@ class TcpGateScheduler < Scheduler
 			conn.observed_fd = io.fileno
 
 			if (events & IO::WRITABLE) > 0
-				puts "write-trigger #{conn.write_fds} until #{io.fileno} writeable"
+				puts "write-trigger #{conn.write_fds} until #{io.fileno} writable"
 				conn.write(transfer_until: io)
 
 				if (events & IO::READABLE) > 0
@@ -292,10 +291,10 @@ class TcpGateScheduler < Scheduler
 			else
 				if (events & IO::READABLE) > 0
 					puts "write-trigger #{conn.write_fds} until wouldblock"
-					# Many applications wait for writablility only in a would-block case.
-					# Then we get no trigger although data was written to the observed IO.
-					# After writing some data the caller usually waits for some answer to read.
-					# We take this event as a trigger to transfer of all pending written data.
+					# libpq waits for writablility only in a would-block case and not before writing.
+					# Since our incoming IO probably doesn't block, we get no write-trigger although data was written to the observed IO.
+					# But after writing some data the caller usually waits for some answer to read.
+					# We take this event as a trigger to transfer all pending written data.
 					conn.write(transfer_until: :wouldblock)
 
 					puts "read-trigger #{conn.read_fds} single block"

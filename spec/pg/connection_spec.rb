@@ -47,6 +47,16 @@ describe YSQL::Connection do
 		expect( vals ).to eq( [["123"]] )
 	end
 
+	it "connects using 7 arguments in a Ractor", :ractor do
+		vals = Ractor.new do
+			PG.connect( 'localhost', @port, nil, nil, :test, nil, nil ) do |conn|
+				conn.exec("SELECT 234").values
+			end
+		end.take
+
+		expect( vals ).to eq( [["234"]] )
+	end
+
 	describe "#inspect", :without_transaction do
 		it "should print host, port and user of a fresh connection, but not more" do
 			expect( @conn.inspect ).to match(/<PG::Connection:[0-9a-fx]+ host=localhost port=#{@port} user=\w*>/)
@@ -377,7 +387,7 @@ describe YSQL::Connection do
 				end
 			end
 
-			expect( Time.now - start_time ).to be_between(1.9, 10).inclusive
+			expect( Time.now - start_time ).to be_between(0.9, 10).inclusive
 		end
 	end
 
@@ -394,7 +404,7 @@ describe YSQL::Connection do
 			@dbms&.teardown
 		end
 
-		it "honors target_session_attrs requirements", :postgresql_10 do
+		it "honors target_session_attrs requirements" do
 			uri = "postgres://localhost:#{@port_ro},localhost:#{@port}/postgres?target_session_attrs=read-write"
 			YSQL.connect(uri) do |conn|
 				expect( conn.port ).to eq( @port )
@@ -407,14 +417,14 @@ describe YSQL::Connection do
 		end
 	end
 
-	it "stops hosts iteration on authentication errors", :without_transaction, :ipv6, :postgresql_10 do
+	it "stops hosts iteration on authentication errors", :without_transaction, :ipv6 do
 		@conn.exec("DROP USER IF EXISTS testusermd5")
 		@conn.exec("CREATE USER testusermd5 PASSWORD 'secret'")
 
 		uri = "host=::1,::1,127.0.0.1 port=#{@port_down},#{@port},#{@port} dbname=postgres user=testusermd5 password=wrong"
 		error_match = if RUBY_PLATFORM=~/mingw|mswin/
 			# It's a long standing issue of libpq, that the error text is not correctly returned when both client and server are running on Windows.
-			# Instead a "Connection refused" is retured.
+			# Instead a "Connection refused" is returned.
 			/authenti.*testusermd5|Connection refused|server closed the connection unexpectedly/i
 		else
 			/authenti.*testusermd5/i
@@ -549,7 +559,7 @@ describe YSQL::Connection do
 			res = @conn2.query("SELECT 4")
 		end
 
-		it "can work with changing IO while connection setup", :postgresql_95 do
+		it "can work with changing IO while connection setup" do
 			# The file_no of the socket IO can change while connecting.
 			# This can happen when alternative hosts are tried,
 			# while GSS authentication
@@ -575,6 +585,21 @@ describe YSQL::Connection do
 			expect( res.values ).to eq([["1"]])
 
 			conn.close
+		end
+
+		it "doesn't notify the wrong thread about closed socket (Bug #564)" do
+			10.times do
+				10.times.map do
+					Thread.new do
+						Thread.current.report_on_exception = false
+						expect do
+							threaded_conn = PG.connect( @conninfo + " sslcert=#{$pg_server.pgdata}/ruby-pg-ca-cert" )
+							threaded_conn.exec("SELECT 1")
+							threaded_conn.close
+						end.not_to raise_error
+					end
+				end.each(&:join)
+			end
 		end
 
 		it "can use conn.reset_start to restart the connection" do
@@ -673,11 +698,8 @@ describe YSQL::Connection do
 		end
 
 		it "rejects to send lots of COPY data" do
-			unless RUBY_PLATFORM =~ /i386-mingw|x86_64-darwin|x86_64-linux/
+			unless RUBY_PLATFORM =~ /i386-mingw|x86_64-darwin|x86_64-linux$/
 				skip "this spec depends on out-of-memory condition in put_copy_data, which is not reliable on all platforms"
-			end
-			if RUBY_ENGINE == "truffleruby"
-				skip "TcpGateSwitcher transfers wrong data on Truffleruby"
 			end
 
 			run_with_gate(200) do |conn, gate|
@@ -706,10 +728,6 @@ describe YSQL::Connection do
 		end
 
 		it "needs to flush data after send_query" do
-			if RUBY_ENGINE == "truffleruby"
-				skip "TcpGateSwitcher transfers wrong data on Truffleruby"
-			end
-
 			run_with_gate(200) do |conn, gate|
 				conn.setnonblocking(true)
 
@@ -755,12 +773,18 @@ describe YSQL::Connection do
 	end
 
 	it "doesn't leave stale server connections after finish" do
+		res = @conn.exec(%[SELECT COUNT(*) AS n FROM pg_stat_activity
+							WHERE usename IS NOT NULL AND application_name != ''])
+		# there's still the global @conn, but should be no more
+		old_count = res[0]['n']
+
 		described_class.connect(@conninfo).finish
+
 		sleep 0.5
 		res = @conn.exec(%[SELECT COUNT(*) AS n FROM pg_stat_activity
 							WHERE usename IS NOT NULL AND application_name != ''])
 		# there's still the global @conn, but should be no more
-		expect( res[0]['n'] ).to eq( '1' )
+		expect( res[0]['n'] ).to eq( old_count )
 	end
 
 	it "can retrieve it's connection parameters for the established connection" do
@@ -888,6 +912,30 @@ describe YSQL::Connection do
 		end
 	end
 
+	context :server_version do
+		it "should retrieve the server version" do
+			expect( @conn.server_version ).to be >= 100000
+		end
+
+		it "should raise an error on a bad connection" do
+			conn = PG::Connection.connect_start( @conninfo )
+			expect{ conn.server_version }.to raise_error(PG::ConnectionBad)
+			conn.finish
+		end
+	end
+
+	context :protocol_version do
+		it "should retrieve the wrie protocol version" do
+			expect( @conn.protocol_version ).to eq 3
+		end
+
+		it "should raise an error on a bad connection" do
+			conn = PG::Connection.connect_start( @conninfo )
+			conn.finish
+			expect{ conn.protocol_version }.to raise_error(PG::ConnectionBad)
+		end
+	end
+
 	it "allows a query to be cancelled" do
 		start = Time.now
 		@conn.set_notice_processor do |notice|
@@ -912,6 +960,24 @@ describe YSQL::Connection do
 						raise Exception, "Oh noes! All pie is gone!"
 					end
 				}.to raise_exception( Exception, /all pie is gone/i )
+
+				res = @conn.exec( "SELECT * FROM pie" )
+				expect( res.ntuples ).to eq( 0 )
+			ensure
+				@conn.exec( "DROP TABLE pie" )
+			end
+		end
+
+		it "rolls back a transaction if a PG::RollbackTransaction exception is raised" do
+			# abort the per-example transaction so we can test our own
+			@conn.exec( 'ROLLBACK' )
+			@conn.exec( "CREATE TABLE pie ( flavor TEXT )" )
+
+			begin
+				@conn.transaction do
+					@conn.exec( "INSERT INTO pie VALUES ('rhubarb'), ('cherry'), ('schizophrenia')" )
+					raise PG::RollbackTransaction
+				end
 
 				res = @conn.exec( "SELECT * FROM pie" )
 				expect( res.ntuples ).to eq( 0 )
@@ -1461,7 +1527,7 @@ describe YSQL::Connection do
 	it "can return the default connection options as a Hash" do
 		expect( described_class.conndefaults_hash ).to be_a( Hash )
 		expect( described_class.conndefaults_hash ).to include( :user, :password, :dbname, :host, :port )
-		expect( ['5432', '54321', @port.to_s] ).to include( described_class.conndefaults_hash[:port] )
+		expect( ['5432', '23456', @port.to_s] ).to include( described_class.conndefaults_hash[:port] )
 		expect( @conn.conndefaults_hash ).to eq( described_class.conndefaults_hash )
 	end
 
@@ -1480,21 +1546,21 @@ describe YSQL::Connection do
 
 	describe "connection information related to SSL" do
 
-		it "can retrieve connection's ssl state", :postgresql_95 do
+		it "can retrieve connection's ssl state" do
 			expect( @conn.ssl_in_use? ).to be true
 		end
 
-		it "can retrieve connection's ssl attribute_names", :postgresql_95 do
+		it "can retrieve connection's ssl attribute_names" do
 			expect( @conn.ssl_attribute_names ).to be_a(Array)
 		end
 
-		it "can retrieve a single ssl connection attribute", :postgresql_95 do
+		it "can retrieve a single ssl connection attribute" do
 			expect( @conn.ssl_attribute('dbname') ).to eq( nil )
 			expect( @conn.ssl_attribute('protocol') ).to match( /^TLSv/ )
 			expect( @conn.ssl_attribute('key_bits') ).to match( /^\d+$/ )
 		end
 
-		it "can retrieve all connection's ssl attributes", :postgresql_95 do
+		it "can retrieve all connection's ssl attributes" do
 			expect( @conn.ssl_attributes ).to be_a_kind_of( Hash )
 		end
 	end
@@ -1507,6 +1573,17 @@ describe YSQL::Connection do
 		ensure
 			conn.finish
 		end
+	end
+
+	it "can connect concurrently in parallel threads" do
+		res = 5.times.map do |idx|
+			Thread.new do
+				PG.connect(@conninfo) do |conn|
+					[conn.ssl_in_use?, conn.exec("select 82").getvalue(0, 0)]
+				end
+			end
+		end.map(&:value)
+		expect( res ).to eq( [[true, "82"]] * 5 )
 	end
 
 	describe "deprecated password encryption method" do
@@ -1527,7 +1604,7 @@ describe YSQL::Connection do
 		end
 	end
 
-	describe "password encryption method", :postgresql_10 do
+	describe "password encryption method" do
 		it "can encrypt without algorithm" do
 			expect( @conn.encrypt_password("postgres", "postgres") ).to match( /\S+/ )
 			expect( @conn.encrypt_password("postgres", "postgres", nil) ).to match( /\S+/ )
@@ -1690,16 +1767,16 @@ describe YSQL::Connection do
 		conn.close
 	end
 
-	it "refreshs DNS address while conn.reset", :without_transaction, :ipv6 do
-		set_etc_hosts "::1"
-		conn = described_class.connect( "postgres://rubypg_test/test" )
+	it "refreshes DNS address while conn.reset", :without_transaction, :ipv6 do
+		set_etc_hosts "::1", "rubypg_test1"
+		conn = described_class.connect( "postgres://rubypg_test1/test" )
 		conn.exec("select 1")
 
-		set_etc_hosts "127.0.0.1"
+		set_etc_hosts "127.0.0.1", "rubypg_test1"
 		conn.reset
 		conn.exec("select 1")
 
-		set_etc_hosts "::2"
+		set_etc_hosts "::2", "rubypg_test1"
 		expect do
 			conn.reset
 			conn.exec("select 1")
@@ -1991,6 +2068,73 @@ describe YSQL::Connection do
 
 	end
 
+	describe "set_chunked_rows_mode", :postgresql_17 do
+
+		it "raises an error when called at the wrong time" do
+			expect {
+				@conn.set_chunked_rows_mode(2)
+			}.to raise_error(PG::Error, /PQsetChunkedRowsMode/){|err| expect(err).to have_attributes(connection: @conn) }
+		end
+
+		it "raises an error when called with wrong arguments" do
+			expect { @conn.set_chunked_rows_mode(:nonint) }.to raise_error(TypeError)
+			expect { @conn.set_chunked_rows_mode(0) }.to raise_error(PG::Error, /PQsetChunkedRowsMode/)
+			expect { @conn.set_chunked_rows_mode(-2) }.to raise_error(PG::Error)
+		end
+
+		it "should work in single row mode" do
+			@conn.send_query( "SELECT generate_series(1,12)" )
+			@conn.set_chunked_rows_mode(3)
+
+			results = []
+			loop do
+				@conn.block
+				res = @conn.get_result or break
+				results << res
+			end
+			expect( results.length ).to eq( 5 )
+			results[0..-2].each do |res|
+				expect( res.result_status ).to eq( PG::PGRES_TUPLES_CHUNK )
+				values = res.field_values('generate_series')
+				expect( values.length ).to eq( 3 )
+				expect( values.first.to_i ).to be > 0
+			end
+			expect( results.last.result_status ).to eq( PG::PGRES_TUPLES_OK )
+			expect( results.last.ntuples ).to eq( 0 )
+		end
+
+		it "should receive rows before entire query is finished" do
+			@conn.send_query( "SELECT generate_series(0,999), NULL UNION ALL SELECT 1000, pg_sleep(10);" )
+			@conn.set_chunked_rows_mode(4)
+
+			start_time = Time.now
+			res = @conn.get_result
+			res.check
+
+			expect( (Time.now - start_time) ).to be < 9
+			expect( res.values ).to eq([["0", nil], ["1", nil], ["2", nil], ["3", nil]])
+			@conn.cancel
+		end
+
+		it "should receive rows before entire query fails" do
+			@conn.exec( "CREATE FUNCTION errfunc() RETURNS int AS $$ BEGIN RAISE 'test-error'; END; $$ LANGUAGE plpgsql;" )
+			@conn.send_query( "SELECT generate_series(0,999), NULL UNION ALL SELECT 1000, errfunc();" )
+			@conn.set_chunked_rows_mode(5)
+
+			first_result = nil
+			expect do
+				loop do
+					res = @conn.get_result or break
+					res.check
+					first_result ||= res
+				end
+			end.to raise_error(PG::Error){|err| expect(err).to have_attributes(connection: @conn) }
+			expect( first_result.kind_of?(PG::Result) ).to be_truthy
+			expect( first_result.result_status ).to eq( PG::PGRES_TUPLES_CHUNK )
+		end
+
+	end
+
 	context "pipeline mode", :postgresql_14 do
 
 		describe "pipeline_status" do
@@ -2053,10 +2197,15 @@ describe YSQL::Connection do
 					@conn.pipeline_sync
 				}.to raise_error(YSQL::Error){|err| expect(err).to have_attributes(connection: @conn) }
 			end
+
+			it "has send_pipeline_sync method", :postgresql_17 do
+				expect( @conn.respond_to?(:send_pipeline_sync) ).to be_truthy
+				expect( @conn.respond_to?(:async_pipeline_sync) ).to be_truthy
+			end
 		end
 
 		describe "send_flush_request" do
-			it "flushs all results" do
+			it "flushes all results" do
 				@conn.enter_pipeline_mode
 				@conn.send_query_params "select 1", []
 				@conn.send_flush_request
@@ -2200,7 +2349,7 @@ describe YSQL::Connection do
 
 			it "uses the previous string encoding for escaped string" do
 				original = "Möhre to 'scape".encode( "iso-8859-1" )
-				@conn.set_client_encoding( "euc_jp" )
+				@conn.set_client_encoding( "iso-8859-2" )
 				escaped  = described_class.escape( original )
 				expect( escaped.encoding ).to eq( Encoding::ISO8859_1 )
 				expect( escaped ).to eq( "Möhre to ''scape".encode(Encoding::ISO8859_1) )
@@ -2249,12 +2398,29 @@ describe YSQL::Connection do
 				@conn.prepare("weiß2", "VALUES(123)")
 				r = @conn.describe_prepared("weiß2".encode("utf-16be"))
 				expect( r.nfields ).to eq( 1 )
+				expect { @conn.prepare("weiß2", "VALUES(123)") }.to raise_error(PG::DuplicatePstatement)
 			end
 
 			it "should convert strings to #describe_portal" do
 				@conn.exec "DECLARE cörsör CURSOR FOR VALUES(1,2,3)"
 				r = @conn.describe_portal("cörsör".encode("utf-16le"))
 				expect( r.nfields ).to eq( 3 )
+			end
+
+			it "should convert strings to #close_prepared", :postgresql_17 do
+				@conn.prepare("weiß5", "VALUES(123)")
+				r = @conn.close_prepared("weiß5".encode("utf-16be"))
+				expect( r.nfields ).to eq( 0 )
+				@conn.prepare("weiß5", "VALUES(123)")
+				r = @conn.close_prepared("weiß5".encode("utf-16be"))
+			end
+
+			it "should convert strings to #close_portal", :postgresql_17 do
+				@conn.exec "DECLARE cörsör5 CURSOR FOR VALUES(1,2,3)"
+				r = @conn.close_portal("cörsör5".encode("utf-16le"))
+				expect( r.nfields ).to eq( 0 )
+				@conn.exec "DECLARE cörsör5 CURSOR FOR VALUES(1,2,3)"
+				r = @conn.close_portal("cörsör5".encode("utf-16le"))
 			end
 
 			it "should convert query string to #send_query" do

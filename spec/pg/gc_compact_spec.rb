@@ -15,7 +15,7 @@
 #       pg_tmbo_mark,
 #       RUBY_TYPED_DEFAULT_FREE,
 #       pg_tmbo_memsize,
-#   //    pg_compact_callback(pg_tmbo_compact),
+#   //    pg_tmbo_compact,
 #     },
 #
 # This should result in a segmentation fault aborting the whole process.
@@ -50,6 +50,12 @@ describe "GC.compact", if: GC.respond_to?(:compact) do
 		TM3 = YSQL::TypeMapByClass.new
 		CPYENC = YSQL::TextEncoder::CopyRow.new type_map: TM3
 		RECENC = YSQL::TextEncoder::Record.new type_map: TM3
+
+		if defined?(PG::CancelConnection)
+			CANCON = PG::CancelConnection.new(CONN2)
+			CANCON.start
+			CANCON.socket_io
+		end
 
 		begin
 			# Use GC.verify_compaction_references instead of GC.compact .
@@ -99,6 +105,10 @@ describe "GC.compact", if: GC.respond_to?(:compact) do
 
 	it "should compact PG::RecordCoder" do
 		expect( RECENC.encode([34]) ).to eq( '("34")' )
+	end
+
+	it "should compact PG::CancelConnection", :postgresql_17 do
+		expect( CANCON.socket_io ).to be_kind_of( IO )
 	end
 
 	after :all do

@@ -404,6 +404,10 @@ Init_ysql_ext(void)
 	/* Checking if server is in standby mode. Available since PostgreSQL-14. */
 	rb_define_const(rb_mPGconstants, "CONNECTION_CHECK_STANDBY", INT2FIX(CONNECTION_CHECK_STANDBY));
 #endif
+#if PG_MAJORVERSION_NUM >= 17
+	/* Waiting for connection attempt to be started. Available since PostgreSQL-17. */
+	rb_define_const(rb_mPGconstants, "CONNECTION_ALLOCATED", INT2FIX(CONNECTION_ALLOCATED));
+#endif
 
 	/******     PG::Connection CLASS CONSTANTS: Nonblocking connection polling status     ******/
 
@@ -451,14 +455,12 @@ Init_ysql_ext(void)
 	rb_define_const(rb_mPGconstants, "PQERRORS_SQLSTATE", INT2FIX(PQERRORS_SQLSTATE));
 #endif
 
-#ifdef HAVE_PQRESULTVERBOSEERRORMESSAGE
 	/* See Connection#set_error_context_visibility */
 	rb_define_const(rb_mPGconstants, "PQSHOW_CONTEXT_NEVER", INT2FIX(PQSHOW_CONTEXT_NEVER));
 	/* See Connection#set_error_context_visibility */
 	rb_define_const(rb_mPGconstants, "PQSHOW_CONTEXT_ERRORS", INT2FIX(PQSHOW_CONTEXT_ERRORS));
 	/* See Connection#set_error_context_visibility */
 	rb_define_const(rb_mPGconstants, "PQSHOW_CONTEXT_ALWAYS", INT2FIX(PQSHOW_CONTEXT_ALWAYS));
-#endif
 
 	/******     PG::Connection CLASS CONSTANTS: Check Server Status ******/
 
@@ -506,6 +508,10 @@ Init_ysql_ext(void)
 	rb_define_const(rb_mPGconstants, "PGRES_COPY_BOTH", INT2FIX(PGRES_COPY_BOTH));
 	/* Result#result_status constant - Single tuple from larger resultset. */
 	rb_define_const(rb_mPGconstants, "PGRES_SINGLE_TUPLE", INT2FIX(PGRES_SINGLE_TUPLE));
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+	/* Result#result_status constant - tuple chunk from larger resultset. */
+	rb_define_const(rb_mPGconstants, "PGRES_TUPLES_CHUNK", INT2FIX(PGRES_TUPLES_CHUNK));
+#endif
 
 #ifdef HAVE_PQENTERPIPELINEMODE
 	/* Result#result_status constant - The PG::Result represents a synchronization point in pipeline mode, requested by Connection#pipeline_sync.
@@ -530,20 +536,18 @@ Init_ysql_ext(void)
 	 */
 	rb_define_const(rb_mPGconstants, "PG_DIAG_SEVERITY", INT2FIX(PG_DIAG_SEVERITY));
 
-#ifdef PG_DIAG_SEVERITY_NONLOCALIZED
 	/* Result#result_error_field argument constant
 	 *
 	 * The severity; the field contents are ERROR, FATAL, or PANIC (in an error message), or WARNING, NOTICE, DEBUG, INFO, or LOG (in a notice message).
 	 * This is identical to the PG_DIAG_SEVERITY field except that the contents are never localized.
 	 *
-	 * Available since PostgreSQL-9.6
 	 */
 	rb_define_const(rb_mPGconstants, "PG_DIAG_SEVERITY_NONLOCALIZED", INT2FIX(PG_DIAG_SEVERITY_NONLOCALIZED));
-#endif
+
 	/* Result#result_error_field argument constant
 	 *
 	 * The SQLSTATE code for the error.
-	 * The SQLSTATE code identies the type of error that has occurred; it can be used by front-end applications to perform specific operations (such as error handling) in response to a particular database error.
+	 * The SQLSTATE code identifies the type of error that has occurred; it can be used by front-end applications to perform specific operations (such as error handling) in response to a particular database error.
 	 * For a list of the possible SQLSTATE codes, see Appendix A.
 	 * This field is not localizable, and is always present.
 	 */
@@ -667,6 +671,12 @@ Init_ysql_ext(void)
 	/* PostgreSQL compiled in default port */
 	rb_define_const(rb_mPGconstants, "DEF_PGPORT", INT2FIX(DEF_PGPORT));
 
+#ifdef PG_IS_BINARY_GEM
+	rb_define_const(rb_mPG, "IS_BINARY_GEM", Qtrue);
+#else
+	rb_define_const(rb_mPG, "IS_BINARY_GEM", Qfalse);
+#endif
+
 	/* Add the constants to the toplevel namespace */
 	rb_include_module( rb_mPG, rb_mPGconstants );
 
@@ -689,4 +699,5 @@ Init_ysql_ext(void)
 	init_pg_copycoder();
 	init_pg_recordcoder();
 	init_pg_tuple();
+	init_pg_cancon();
 }

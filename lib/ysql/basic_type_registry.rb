@@ -127,8 +127,8 @@ class YSQL::BasicTypeRegistry
 			@maps = [
 				[0, :encoder, YSQL::TextEncoder::Array],
 				[0, :decoder, YSQL::TextDecoder::Array],
-				[1, :encoder, nil],
-				[1, :decoder, nil],
+				[1, :encoder, YSQL::BinaryEncoder::Array],
+				[1, :decoder, YSQL::BinaryDecoder::Array],
 			].inject([]) do |h, (format, direction, arraycoder)|
 				coders = registry.coders_for(format, direction) || {}
 				h[format] ||= {}
@@ -171,7 +171,14 @@ class YSQL::BasicTypeRegistry
 	include Checker
 
 	def initialize
-		# The key of these hashs maps to the `typname` column from the table pg_type.
+		# @coders_by_name has a content of
+		#    Array< Hash< Symbol: Hash< String: Coder > > >
+		#
+		# The layers are:
+		#   * index of Array is 0 (text) and 1 (binary)
+		#   * Symbol key in the middle Hash is :encoder and :decoder
+		#   * String key in the inner Hash corresponds to the `typname` column in the table pg_type
+		#   * Coder value in the inner Hash is the associated coder object
 		@coders_by_name = []
 	end
 
@@ -271,6 +278,7 @@ class YSQL::BasicTypeRegistry
 		register_type 0, 'inet', YSQL::TextEncoder::Inet, YSQL::TextDecoder::Inet
 		alias_type 0, 'cidr', 'inet'
 
+		register_type 0, 'record', PG::TextEncoder::Record, PG::TextDecoder::Record
 
 
 		register_type 1, 'int2', YSQL::BinaryEncoder::Int2, YSQL::BinaryDecoder::Integer

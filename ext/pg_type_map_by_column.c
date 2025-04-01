@@ -54,6 +54,7 @@ pg_tmbc_fit_to_query( VALUE self, VALUE params )
 	t_tmbc *this = RTYPEDDATA_DATA( self );
 	t_typemap *default_tm;
 
+	Check_Type(params, T_ARRAY);
 	nfields = (int)RARRAY_LEN( params );
 	if ( this->nfields != nfields ) {
 		rb_raise( rb_eArgError, "number of result fields (%d) does not match number of mapped columns (%d)",
@@ -228,7 +229,7 @@ static const rb_data_type_t pg_tmbc_type = {
 		pg_tmbc_mark,
 		pg_tmbc_free,
 		pg_tmbc_memsize,
-		pg_compact_callback(pg_tmbc_compact),
+		pg_tmbc_compact,
 	},
 	&pg_typemap_type,
 	0,

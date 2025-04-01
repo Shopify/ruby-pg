@@ -76,14 +76,7 @@ typedef long suseconds_t;
 	#define PG_MAX_COLUMNS 4000
 #endif
 
-#ifdef HAVE_RB_GC_MARK_MOVABLE
-#define pg_compact_callback(x) (x)
 #define pg_gc_location(x) x = rb_gc_location(x)
-#else
-#define rb_gc_mark_movable(x) rb_gc_mark(x)
-#define pg_compact_callback(x) {(x)}
-#define pg_gc_location(x) UNUSED(x)
-#endif
 
 /* For compatibility with ruby < 3.0 */
 #ifndef RUBY_TYPED_FROZEN_SHAREABLE
@@ -123,10 +116,8 @@ typedef struct {
 	/* enable automatic flushing of send data at the end of send_query calls */
 	unsigned int flush_data : 1;
 
-#if defined(_WIN32)
 	/* File descriptor to be used for rb_w32_unwrap_io_handle() */
 	int ruby_sd;
-#endif
 } t_pg_connection;
 
 typedef struct pg_coder t_pg_coder;
@@ -215,6 +206,7 @@ typedef struct {
 	t_pg_coder comp;
 	t_pg_coder *elem;
 	int needs_quotation;
+	int dimensions;
 	char delimiter;
 } t_pg_composite_coder;
 
@@ -312,6 +304,7 @@ void init_pg_text_decoder                              _(( void ));
 void init_pg_binary_encoder                            _(( void ));
 void init_pg_binary_decoder                            _(( void ));
 void init_pg_tuple                                     _(( void ));
+void init_pg_cancon                                    _(( void ));
 VALUE lookup_error_class                               _(( const char * ));
 VALUE pg_bin_dec_bytea                                 _(( t_pg_coder*, const char *, int, int, int, int ));
 VALUE pg_text_dec_string                               _(( t_pg_coder*, const char *, int, int, int, int ));
@@ -351,6 +344,13 @@ void pg_typemap_compact                                _(( void * ));
 PGconn *pg_get_pgconn                                  _(( VALUE ));
 t_pg_connection *pg_get_connection                     _(( VALUE ));
 VALUE pgconn_block                                     _(( int, VALUE *, VALUE ));
+#ifdef __GNUC__
+__attribute__((format(printf, 3, 4)))
+#endif
+NORETURN(void pg_raise_conn_error                      _(( VALUE klass, VALUE self, const char *format, ...)));
+VALUE pg_wrap_socket_io                                _(( int sd, VALUE self, VALUE *p_socket_io, int *p_ruby_sd ));
+void pg_unwrap_socket_io                               _(( VALUE self, VALUE *p_socket_io, int ruby_sd ));
+
 
 VALUE pg_new_result                                    _(( PGresult *, VALUE ));
 VALUE pg_new_result_autoclear                          _(( PGresult *, VALUE ));
