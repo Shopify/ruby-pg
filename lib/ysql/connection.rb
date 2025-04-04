@@ -344,16 +344,19 @@ class YSQL::Connection
 		exec "COMMIT" unless rollback
 	end
 
+	EXTRA_CONNDEFAULTS = [
+		{:keyword=>"load_balance", :label=>"YB-Load-Balance", :dispchar=>"", :dispsize=>5},
+		{:keyword=>"topology_keys", :label=>"YB-Topology-Keys", :dispchar=>"", :dispsize=>64},
+		{:keyword=>"yb_servers_refresh_interval", :label=>"YB-Refresh-Interval", :dispchar=>"", :dispsize=>3},
+		{:keyword=>"fallback_to_topology_keys_only", :label=>"YB-Fallback-To-Topology-Keys-Only", :dispchar=>"", :dispsize=>5},
+		{:keyword=>"failed_host_reconnect_delay_secs", :label=>"YB-Failed-Host-Reconnect-Delay", :dispchar=>"", :dispsize=>3}
+	].freeze
+
 	### Returns an array of Hashes with connection defaults. See ::conndefaults
 	### for details.
 	def conndefaults
 		original = self.class.conndefaults
-		original << {:keyword=>"load_balance", :label=>"YB-Load-Balance", :dispchar=>"", :dispsize=>5}
-		original << {:keyword=>"topology_keys", :label=>"YB-Topology-Keys", :dispchar=>"", :dispsize=>64}
-		original << {:keyword=>"yb_servers_refresh_interval", :label=>"YB-Refresh-Interval", :dispchar=>"", :dispsize=>3}
-		original << {:keyword=>"fallback_to_topology_keys_only", :label=>"YB-Fallback-To-Topology-Keys-Only", :dispchar=>"", :dispsize=>5}
-		original << {:keyword=>"failed_host_reconnect_delay_secs", :label=>"YB-Failed-Host-Reconnect-Delay", :dispchar=>"", :dispsize=>3}
-
+		original += EXTRA_CONNDEFAULTS
 		original
 	end
 
@@ -362,7 +365,8 @@ class YSQL::Connection
 	###
 	### See also #conndefaults
 	def self.conndefaults_hash
-		return self.conndefaults.each_with_object({}) do |info, hash|
+		conndefaults = self.conndefaults + EXTRA_CONNDEFAULTS
+		return conndefaults.each_with_object({}) do |info, hash|
 			hash[ info[:keyword].to_sym ] = info[:val]
 		end
 	end
